@@ -1,0 +1,14 @@
+# Build artifacts
+rust-udp-mqtt/target/
+c-udp-mqtt/build/
+bench/results/*.txt
+bench/results/*.log
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
