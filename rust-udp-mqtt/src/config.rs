@@ -1,18 +1,39 @@
-use clap::Parser;
+use clap::{ Parser, ValueEnum };
 
-/// High-performance UDP → MQTT QoS 0 sensor data bridge
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    Udp,
+    Tcp,
+    Mqtt,
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Udp => write!(f, "UDP"),
+            Transport::Tcp => write!(f, "TCP"),
+            Transport::Mqtt => write!(f, "MQTT"),
+        }
+    }
+}
+
+/// High-performance multi-transport sensor data processor with VAD computation
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about)]
 pub struct Config {
-    /// UDP listen address
+    /// Input transport: udp, tcp, or mqtt
+    #[arg(long, value_enum, default_value_t = Transport::Udp)]
+    pub transport: Transport,
+
+    /// Listen address for UDP/TCP
     #[arg(long, default_value = "0.0.0.0")]
-    pub udp_host: String,
+    pub host: String,
 
-    /// UDP listen port
+    /// Listen port for UDP/TCP
     #[arg(long, default_value_t = 9000)]
-    pub udp_port: u16,
+    pub port: u16,
 
-    /// MQTT broker host
+    /// MQTT broker host (for mqtt transport)
     #[arg(long, default_value = "127.0.0.1")]
     pub mqtt_host: String,
 
@@ -20,42 +41,46 @@ pub struct Config {
     #[arg(long, default_value_t = 1883)]
     pub mqtt_port: u16,
 
-    /// MQTT topic prefix — sensor data published to {prefix}/{sensor_id}
-    #[arg(long, default_value = "vad/sensors")]
-    pub mqtt_topic_prefix: String,
+    /// MQTT subscribe topic (for mqtt transport input)
+    #[arg(long, default_value = "vad/sensors/+")]
+    pub mqtt_topic: String,
 
     /// MQTT client ID
-    #[arg(long, default_value = "vad-sensor-bridge")]
+    #[arg(long, default_value = "vad-processor-rust")]
     pub mqtt_client_id: String,
 
-    /// MQTT keep-alive seconds
-    #[arg(long, default_value_t = 30)]
-    pub mqtt_keep_alive_secs: u16,
-
-    /// Size of the internal channel between UDP receiver and MQTT publisher
+    /// Size of the internal processing channel
     #[arg(long, default_value_t = 65536)]
     pub channel_capacity: usize,
 
-    /// UDP receive buffer size (SO_RCVBUF)
+    /// UDP/TCP receive buffer size (SO_RCVBUF)
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
-    pub udp_recv_buf_size: usize,
+    pub recv_buf_size: usize,
 
-    /// Number of UDP receiver threads (0 = num CPUs)
-    #[arg(long, default_value_t = 0)]
-    pub udp_threads: usize,
+    /// Number of receiver threads (0 = num CPUs, applies to UDP)
+    #[arg(long, default_value_t = 4)]
+    pub recv_threads: usize,
 
-    /// Enable performance stats logging every N seconds (0 = disabled)
+    /// Number of VAD processor threads (0 = num CPUs)
+    #[arg(long, default_value_t = 2)]
+    pub proc_threads: usize,
+
+    /// Stats logging interval in seconds (0 = disabled)
     #[arg(long, default_value_t = 5)]
     pub stats_interval_secs: u64,
 }
 
 impl Config {
-    pub fn udp_addr(&self) -> String {
-        format!("{}:{}", self.udp_host, self.udp_port)
+    pub fn listen_addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
 
-    pub fn resolved_udp_threads(&self) -> usize {
-        if self.udp_threads == 0 { num_cpus() } else { self.udp_threads }
+    pub fn resolved_recv_threads(&self) -> usize {
+        if self.recv_threads == 0 { num_cpus() } else { self.recv_threads }
+    }
+
+    pub fn resolved_proc_threads(&self) -> usize {
+        if self.proc_threads == 0 { num_cpus() } else { self.proc_threads }
     }
 }
 

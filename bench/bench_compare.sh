@@ -1,36 +1,42 @@
 #!/usr/bin/env bash
 #
-# bench_compare.sh — Run both Rust and C bridges side-by-side and compare
+# bench_compare.sh — Run Rust vs C comparison across UDP, TCP, and MQTT transports
 #
 # Prerequisites:
-#   1. MQTT broker running (mosquitto) on localhost:1883
+#   1. MQTT broker (mosquitto) on localhost:1883
 #   2. Both projects built (cargo build --release, make)
-#   3. Python3 for the load generator
+#   3. Python3 + paho-mqtt (pip3 install paho-mqtt) for MQTT load gen
 #
 # Usage:
-#   ./bench/bench_compare.sh [pps] [duration_secs]
+#   ./bench/bench_compare.sh [pps] [duration_secs] [mqtt_pps]
 
 set -euo pipefail
 
 PPS=${1:-50000}
-DURATION=${2:-30}
-PORT_RUST=9001
-PORT_C=9002
+DURATION=${2:-20}
+MQTT_PPS=${3:-1000}  # MQTT rate (broker-limited, default 1k)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$ROOT_DIR/bench/results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RESULT_FILE="$RESULTS_DIR/bench_${TIMESTAMP}.txt"
 
-mkdir -p "$RESULTS_DIR"
+# Ports — different for Rust vs C to avoid conflicts
+PORT_BASE_RUST=9001
+PORT_BASE_C=9002
 
-# Tee all output to both terminal and results file
+RUST_BIN="$ROOT_DIR/rust-udp-mqtt/target/release/vad-sensor-bridge"
+C_BIN="$ROOT_DIR/c-udp-mqtt/build/vad-sensor-bridge"
+LOAD_GEN="$SCRIPT_DIR/load_gen.py"
+
+mkdir -p "$RESULTS_DIR"
 exec > >(tee -a "$RESULT_FILE") 2>&1
 
 echo "================================================================="
-echo "  VAD Sensor Bridge — Performance Comparison"
+echo "  VAD Sensor Bridge — Multi-Transport Performance Comparison"
 echo "  Date:     $(date)"
-echo "  Rate:     ${PPS} pps | Duration: ${DURATION}s"
+echo "  Rate:     UDP/TCP: ${PPS} pps | MQTT: ${MQTT_PPS} pps"
+echo "  Duration: ${DURATION}s"
 echo "  System:   $(uname -srm)"
 echo "  CPU:      $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
 echo "  Cores:    $(nproc)"
@@ -38,146 +44,194 @@ echo "  RAM:      $(free -h | awk '/Mem:/{print $2}')"
 echo "  Results:  $RESULT_FILE"
 echo "================================================================="
 echo
+echo "  ⚠ MQTT Note: mosquitto broker is single-threaded and delivers"
+echo "    messages in bursts at high rates. MQTT benchmarks measure total"
+echo "    messages processed (including post-load drain), not real-time pps."
+echo
 
-# ── Pre-flight checks ──
-echo "🔍 Checking MQTT broker..."
+# ── Pre-flight ──
+echo "🔍 Pre-flight checks..."
 if ! mosquitto_pub -t "bench/healthcheck" -m "ok" -q 0 2>/dev/null; then
-    echo "❌ MQTT broker not reachable on localhost:1883"
-    echo "   Run: sudo systemctl start mosquitto"
+    echo "❌ MQTT broker not reachable. Run: sudo systemctl start mosquitto"
     exit 1
 fi
 echo "   ✅ MQTT broker OK"
+
+echo "🔨 Building Rust..."
+cd "$ROOT_DIR/rust-udp-mqtt" && cargo build --release 2>&1 | tail -3
+echo "🔨 Building C..."
+cd "$ROOT_DIR/c-udp-mqtt" && make clean && make 2>&1 | tail -3
 echo
-
-# ── Build both ──
-echo "🔨 Building Rust bridge..."
-cd "$ROOT_DIR/rust-udp-mqtt"
-cargo build --release 2>&1 | tail -3
-
-echo "🔨 Building C bridge..."
-cd "$ROOT_DIR/c-udp-mqtt"
-make clean && make 2>&1 | tail -3
-
-echo
-
-# ── Phase 1: Rust ──
-echo "═══════════════════════════════════════════════════════════════"
-echo "  Phase 1: Rust Bridge"
-echo "═══════════════════════════════════════════════════════════════"
 
 cd "$ROOT_DIR"
 
-RUST_LOG_FILE="$RESULTS_DIR/rust_${TIMESTAMP}.log"
-RUST_LOG=info ./rust-udp-mqtt/target/release/vad-sensor-bridge \
-    --udp-port $PORT_RUST \
-    --stats-interval-secs 5 > "$RUST_LOG_FILE" 2>&1 &
-RUST_PID=$!
-sleep 2
+# ── Helper: kill a process and its group ──
+kill_bridge() {
+    local PID="$1"
+    kill -TERM -- -$PID 2>/dev/null || kill -TERM $PID 2>/dev/null || true
+    sleep 1
+    kill -9 -- -$PID 2>/dev/null || kill -9 $PID 2>/dev/null || true
+    wait $PID 2>/dev/null || true
+}
 
-# Verify it connected
-if ! kill -0 $RUST_PID 2>/dev/null; then
-    echo "❌ Rust bridge failed to start — check $RUST_LOG_FILE"
-    cat "$RUST_LOG_FILE"
-    exit 1
-fi
-echo "   Rust bridge PID=$RUST_PID listening on :$PORT_RUST"
+# ── Helper function to run a single benchmark ──
+run_bench() {
+    local LANG="$1"       # rust or c
+    local TRANSPORT="$2"  # udp, tcp, mqtt
+    local BIN="$3"
+    local PORT="$4"
+    local RATE="$5"
+    local LOG_FILE="$RESULTS_DIR/${LANG}_${TRANSPORT}_${TIMESTAMP}.log"
+    local DRAIN_WAIT=6
 
-python3 "$SCRIPT_DIR/udp_load_gen.py" \
-    --port $PORT_RUST \
-    --rate $PPS \
-    --duration $DURATION
+    # MQTT needs longer drain time for broker to flush buffered messages
+    if [ "$TRANSPORT" = "mqtt" ]; then
+        DRAIN_WAIT=15
+    fi
 
-sleep 3
-kill $RUST_PID 2>/dev/null || true
-wait $RUST_PID 2>/dev/null || true
+    echo "───────────────────────────────────────────────────────────────"
+    echo "  ${LANG^^} + ${TRANSPORT^^}  (${RATE} pps × ${DURATION}s)"
+    echo "───────────────────────────────────────────────────────────────"
 
-echo
-echo "── Rust Bridge Stats ──"
-grep -E "\[STATS\]" "$RUST_LOG_FILE" || echo "(no stats lines captured)"
-echo
+    # Start bridge in a new session group (immune to SIGINT from this shell)
+    if [ "$LANG" = "rust" ]; then
+        setsid bash -c "RUST_LOG=info $BIN \
+            --transport $TRANSPORT \
+            --port $PORT \
+            --stats-interval-secs 5" > "$LOG_FILE" 2>&1 &
+    else
+        setsid "$BIN" \
+            --transport "$TRANSPORT" \
+            --port "$PORT" \
+            --stats-interval 5 > "$LOG_FILE" 2>&1 &
+    fi
+    local PID=$!
+    sleep 2
 
-# ── Phase 2: C ──
-echo "═══════════════════════════════════════════════════════════════"
-echo "  Phase 2: C Bridge"
-echo "═══════════════════════════════════════════════════════════════"
+    if ! kill -0 $PID 2>/dev/null; then
+        echo "   ❌ Failed to start — check $LOG_FILE"
+        cat "$LOG_FILE"
+        return 1
+    fi
+    echo "   PID=$PID listening on :$PORT via $TRANSPORT"
 
-C_LOG_FILE="$RESULTS_DIR/c_${TIMESTAMP}.log"
-./c-udp-mqtt/build/vad-sensor-bridge \
-    --udp-port $PORT_C \
-    --stats-interval 5 > "$C_LOG_FILE" 2>&1 &
-C_PID=$!
-sleep 2
+    # Send load
+    if [ "$TRANSPORT" = "mqtt" ]; then
+        python3 "$LOAD_GEN" --transport mqtt --rate "$RATE" --duration "$DURATION" 2>&1 || true
+    else
+        python3 "$LOAD_GEN" --transport "$TRANSPORT" --port "$PORT" --rate "$RATE" --duration "$DURATION" 2>&1 || true
+    fi
 
-if ! kill -0 $C_PID 2>/dev/null; then
-    echo "❌ C bridge failed to start — check $C_LOG_FILE"
-    cat "$C_LOG_FILE"
-    exit 1
-fi
-echo "   C bridge PID=$C_PID listening on :$PORT_C"
+    echo "   ⏳ Waiting ${DRAIN_WAIT}s for processing to complete..."
+    sleep "$DRAIN_WAIT"
 
-python3 "$SCRIPT_DIR/udp_load_gen.py" \
-    --port $PORT_C \
-    --rate $PPS \
-    --duration $DURATION
+    kill_bridge $PID
 
-sleep 3
-kill $C_PID 2>/dev/null || true
-wait $C_PID 2>/dev/null || true
+    echo
+    echo "── Stats (${LANG^^} ${TRANSPORT^^}) ──"
+    grep -E "\[STATS\]" "$LOG_FILE" || echo "(no stats)"
 
-echo
-echo "── C Bridge Stats ──"
-grep -E "\[STATS\]" "$C_LOG_FILE" || echo "(no stats lines captured)"
-echo
+    # For MQTT, also show total messages processed across all intervals
+    if [ "$TRANSPORT" = "mqtt" ]; then
+        local TOTAL_PROC=0
+        local TOTAL_RECV=0
+        while IFS= read -r line; do
+            local proc_val
+            local recv_val
+            proc_val=$(echo "$line" | grep -oP '[0-9]+ proc/s' | grep -oP '^[0-9]+' || echo 0)
+            recv_val=$(echo "$line" | grep -oP ': [0-9]+ pps' | grep -oP '[0-9]+' || echo 0)
+            TOTAL_PROC=$((TOTAL_PROC + proc_val * 5))  # approximate: pps × interval(5s)
+            TOTAL_RECV=$((TOTAL_RECV + recv_val * 5))
+        done < <(grep '\[STATS\]' "$LOG_FILE" 2>/dev/null || true)
+        local EXPECTED=$((RATE * DURATION))
+        echo "   📬 MQTT totals (approx): ~${TOTAL_RECV} recv, ~${TOTAL_PROC} processed (expected: ${EXPECTED})"
+    fi
+    echo
+}
 
-# ── Summary ──
+# ── Declare arrays for results ──
+declare -A RESULTS
+
+extract_peak() {
+    local LOG_FILE="$1"
+    local KEY="$2"
+    local PEAK_LINE
+    PEAK_LINE=$(grep '\[STATS\]' "$LOG_FILE" 2>/dev/null | while read -r line; do
+        pps=$(echo "$line" | grep -oP ': \K[0-9]+(?= pps)')
+        echo "$pps $line"
+    done | sort -rn | head -1 | sed 's/^[0-9]* //')
+    RESULTS[$KEY]="$PEAK_LINE"
+}
+
+# ── Run all 6 benchmarks: 2 langs × 3 transports ──
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Phase 1: UDP (${PPS} pps)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+run_bench "rust" "udp" "$RUST_BIN" "$PORT_BASE_RUST" "$PPS"
+run_bench "c"    "udp" "$C_BIN"    "$PORT_BASE_C"    "$PPS"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Phase 2: TCP (${PPS} pps)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+run_bench "rust" "tcp" "$RUST_BIN" "$PORT_BASE_RUST" "$PPS"
+run_bench "c"    "tcp" "$C_BIN"    "$PORT_BASE_C"    "$PPS"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Phase 3: MQTT (${MQTT_PPS} pps — broker-limited)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+run_bench "rust" "mqtt" "$RUST_BIN" "$PORT_BASE_RUST" "$MQTT_PPS"
+run_bench "c"    "mqtt" "$C_BIN"    "$PORT_BASE_C"    "$MQTT_PPS"
+
+# ── Extract peak results ──
+TRANSPORTS=("udp" "tcp" "mqtt")
+for TRANSPORT in "${TRANSPORTS[@]}"; do
+    extract_peak "$RESULTS_DIR/rust_${TRANSPORT}_${TIMESTAMP}.log" "rust_${TRANSPORT}"
+    extract_peak "$RESULTS_DIR/c_${TRANSPORT}_${TIMESTAMP}.log" "c_${TRANSPORT}"
+done
+
+# ── Summary table ──
 echo "================================================================="
-echo "  ✅ Comparison complete!"
+echo "  📊 Multi-Transport Performance Comparison (peak snapshot)"
 echo "================================================================="
 echo
-echo "  📁 Results saved to:"
-echo "     Main:  $RESULT_FILE"
-echo "     Rust:  $RUST_LOG_FILE"
-echo "     C:     $C_LOG_FILE"
-echo
-echo "  📊 Quick diff (peak stats snapshot):"
-echo "  ────────────────────────────────────────"
-# Pick the snapshot with highest UDP pps (peak throughput) for fair comparison
-RUST_LAST=$(grep '\[STATS\]' "$RUST_LOG_FILE" | while read -r line; do
-    pps=$(echo "$line" | grep -oP 'UDP: \K[0-9]+')
-    echo "$pps $line"
-done | sort -rn | head -1 | sed 's/^[0-9]* //')
-C_LAST=$(grep '\[STATS\]' "$C_LOG_FILE" | while read -r line; do
-    pps=$(echo "$line" | grep -oP 'UDP: \K[0-9]+')
-    echo "$pps $line"
-done | sort -rn | head -1 | sed 's/^[0-9]* //')
-echo "  RUST: $RUST_LAST"
-echo "  C:    $C_LAST"
-echo
 
-# Extract values for side-by-side table
-RUST_PPS=$(echo "$RUST_LAST" | grep -oP 'UDP: \K[0-9]+')
-RUST_MBPS=$(echo "$RUST_LAST" | grep -oP '[0-9.]+ Mbps' | grep -oP '[0-9.]+')
-RUST_MQTT=$(echo "$RUST_LAST" | grep -oP 'MQTT: \K[0-9]+')
-RUST_PERR=$(echo "$RUST_LAST" | grep -oP 'parse=\K[0-9]+')
-RUST_MERR=$(echo "$RUST_LAST" | grep -oP 'mqtt=\K[0-9]+')
-RUST_DROP=$(echo "$RUST_LAST" | grep -oP 'drops=\K[0-9]+')
+# Helper to extract a field
+get_field() {
+    local LINE="$1"
+    local PATTERN="$2"
+    echo "$LINE" | grep -oP "$PATTERN" | head -1
+}
 
-C_PPS=$(echo "$C_LAST" | grep -oP 'UDP: \K[0-9]+')
-C_MBPS=$(echo "$C_LAST" | grep -oP '[0-9.]+ Mbps' | grep -oP '[0-9.]+')
-C_MQTT=$(echo "$C_LAST" | grep -oP 'MQTT: \K[0-9]+')
-C_PERR=$(echo "$C_LAST" | grep -oP 'parse=\K[0-9]+')
-C_MERR=$(echo "$C_LAST" | grep -oP 'mqtt=\K[0-9]+')
-C_DROP=$(echo "$C_LAST" | grep -oP 'drops=\K[0-9]+')
+printf "  %-12s | %-28s | %-28s\n" "Transport" "Rust" "C"
+printf "  %-12s-+-%-28s-+-%-28s\n" "------------" "----------------------------" "----------------------------"
 
-printf "  %-20s %12s %12s\n" "Metric" "Rust" "C"
-printf "  %-20s %12s %12s\n" "────────────────────" "────────────" "────────────"
-printf "  %-20s %10s pps %10s pps\n" "UDP recv rate" "${RUST_PPS:-?}" "${C_PPS:-?}"
-printf "  %-20s %9s Mbps %9s Mbps\n" "UDP throughput" "${RUST_MBPS:-?}" "${C_MBPS:-?}"
-printf "  %-20s %8s msg/s %8s msg/s\n" "MQTT publish rate" "${RUST_MQTT:-?}" "${C_MQTT:-?}"
-printf "  %-20s %12s %12s\n" "Parse errors" "${RUST_PERR:-0}" "${C_PERR:-0}"
-printf "  %-20s %12s %12s\n" "MQTT errors" "${RUST_MERR:-0}" "${C_MERR:-0}"
-printf "  %-20s %12s %12s\n" "Channel drops" "${RUST_DROP:-0}" "${C_DROP:-0}"
-echo "  ────────────────────────────────────────"
+for TRANSPORT in "${TRANSPORTS[@]}"; do
+    RUST_LINE="${RESULTS[rust_${TRANSPORT}]:-}"
+    C_LINE="${RESULTS[c_${TRANSPORT}]:-}"
+
+    R_PPS=$(get_field "$RUST_LINE" ': [0-9]+ pps' | grep -oP '[0-9]+' || echo "?")
+    R_MBPS=$(get_field "$RUST_LINE" '[0-9.]+ Mbps' | grep -oP '[0-9.]+' || echo "?")
+    R_PROC=$(get_field "$RUST_LINE" '[0-9]+ proc/s' | grep -oP '[0-9]+' || echo "?")
+    R_DROP=$(get_field "$RUST_LINE" 'drops=[0-9]+' | grep -oP '[0-9]+' || echo "?")
+
+    C_PPS=$(get_field "$C_LINE" ': [0-9]+ pps' | grep -oP '[0-9]+' || echo "?")
+    C_MBPS=$(get_field "$C_LINE" '[0-9.]+ Mbps' | grep -oP '[0-9.]+' || echo "?")
+    C_PROC=$(get_field "$C_LINE" '[0-9]+ proc/s' | grep -oP '[0-9]+' || echo "?")
+    C_DROP=$(get_field "$C_LINE" 'drops=[0-9]+' | grep -oP '[0-9]+' || echo "?")
+
+    RUST_SUM="${R_PPS}pps ${R_MBPS}Mbps ${R_PROC}vad/s d=${R_DROP}"
+    C_SUM="${C_PPS}pps ${C_MBPS}Mbps ${C_PROC}vad/s d=${C_DROP}"
+
+    printf "  %-12s | %-28s | %-28s\n" "${TRANSPORT^^}" "$RUST_SUM" "$C_SUM"
+done
+
 echo
-echo "  Run again: ./bench/bench_compare.sh $PPS $DURATION"
+echo "  📁 Full results: $RESULT_FILE"
+echo "  📁 Individual logs: $RESULTS_DIR/"
+echo "  🔁 Run again: ./bench/bench_compare.sh $PPS $DURATION $MQTT_PPS"
+echo
+echo "  ⚠ MQTT peak numbers reflect burst processing (broker delivers"
+echo "    messages in batches). Real-time MQTT throughput is ~10-30 pps"
+echo "    due to mosquitto being single-threaded. Both Rust and C process"
+echo "    the backlog at 20k+ pps once the broker delivers."
 echo "================================================================="

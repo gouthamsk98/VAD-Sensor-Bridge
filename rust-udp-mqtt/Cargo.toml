@@ -1,15 +1,15 @@
 [package]
 name = "vad-sensor-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "High-performance UDP→MQTT QoS 0 sensor data bridge"
+description = "High-performance multi-transport sensor data processor with VAD computation"
 
 [dependencies]
-# Async runtime — tokio with io_uring on Linux for max perf
+# Async runtime
 tokio = { version = "1", features = ["full"] }
-# Zero-copy MQTT v5 client, QoS 0 fire-and-forget
+# MQTT client (subscribe + publish)
 rumqttc = { version = "0.24", features = ["use-rustls"] }
-# Fast serialization
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Logging
@@ -17,8 +17,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TTY detection for ANSI color control
 atty = "0.2"
-# Stats / metrics
-hdrhistogram = "7"
 # CLI args
 clap = { version = "4", features = ["derive"] }
 # Byte manipulation

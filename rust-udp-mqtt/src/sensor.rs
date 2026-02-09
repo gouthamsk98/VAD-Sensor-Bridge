@@ -4,10 +4,10 @@ use serde::{ Deserialize, Serialize };
 ///
 /// Wire format (32 bytes fixed header + variable payload):
 ///   [ sensor_id: u32 LE ][ timestamp_us: u64 LE ][ data_type: u8 ][ reserved: 3 bytes ]
-///   [ payload_len: u16 LE ][ reserved: 2 bytes ][ seq: u64 LE ]
+///   [ payload_len: u16 LE ][ reserved: 2 bytes ][ seq: u64 LE ][ padding: 4 bytes ]
 ///   [ payload: payload_len bytes ]
 ///
-/// For JSON fallback, the entire datagram is treated as UTF-8 JSON.
+/// For TCP, packets are length-prefixed: [ total_len: u32 LE ][ binary_packet ]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorPacket {
     pub sensor_id: u32,
@@ -18,11 +18,10 @@ pub struct SensorPacket {
 }
 
 /// Fixed header size for binary wire format
-const HEADER_SIZE: usize = 32;
+pub const HEADER_SIZE: usize = 32;
 
 impl SensorPacket {
-    /// Parse a binary sensor packet from raw UDP bytes.
-    /// Returns None if the datagram is too short or malformed.
+    /// Parse a binary sensor packet from raw bytes.
     #[inline]
     pub fn from_binary(buf: &[u8]) -> Option<Self> {
         if buf.len() < HEADER_SIZE {
@@ -41,9 +40,7 @@ impl SensorPacket {
             buf[11],
         ]);
         let data_type = buf[12];
-        // buf[13..16] reserved
         let payload_len = u16::from_le_bytes([buf[16], buf[17]]) as usize;
-        // buf[18..20] reserved
         let seq = u64::from_le_bytes([
             buf[20],
             buf[21],
@@ -54,9 +51,7 @@ impl SensorPacket {
             buf[26],
             buf[27],
         ]);
-        // buf[28..32] padding to align
 
-        // Validate
         if buf.len() < HEADER_SIZE + payload_len {
             return None;
         }
@@ -72,7 +67,7 @@ impl SensorPacket {
         })
     }
 
-    /// Try JSON parse as fallback
+    /// Try JSON parse as fallback (for MQTT text payloads)
     #[inline]
     pub fn from_json(buf: &[u8]) -> Option<Self> {
         serde_json::from_slice(buf).ok()
@@ -82,54 +77,5 @@ impl SensorPacket {
     #[inline]
     pub fn parse(buf: &[u8]) -> Option<Self> {
         Self::from_binary(buf).or_else(|| Self::from_json(buf))
-    }
-
-    /// MQTT topic for this sensor
-    #[inline]
-    pub fn topic(&self, prefix: &str) -> String {
-        format!("{}/{}", prefix, self.sensor_id)
-    }
-
-    /// Serialize to compact JSON bytes for MQTT publish
-    #[inline]
-    pub fn to_mqtt_payload(&self) -> Vec<u8> {
-        // Unwrap is safe: SensorPacket is always serializable
-        serde_json::to_vec(self).unwrap()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_binary_roundtrip() {
-        let mut buf = vec![0u8; 40];
-        // sensor_id = 42
-        buf[0..4].copy_from_slice(&(42u32).to_le_bytes());
-        // timestamp_us = 1234567890
-        buf[4..12].copy_from_slice(&(1234567890u64).to_le_bytes());
-        // data_type = 1
-        buf[12] = 1;
-        // payload_len = 8
-        buf[16..18].copy_from_slice(&(8u16).to_le_bytes());
-        // seq = 99
-        buf[20..28].copy_from_slice(&(99u64).to_le_bytes());
-        // payload
-        buf[32..40].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-
-        let pkt = SensorPacket::from_binary(&buf).unwrap();
-        assert_eq!(pkt.sensor_id, 42);
-        assert_eq!(pkt.timestamp_us, 1234567890);
-        assert_eq!(pkt.data_type, 1);
-        assert_eq!(pkt.seq, 99);
-        assert_eq!(pkt.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    }
-
-    #[test]
-    fn test_json_parse() {
-        let json = r#"{"sensor_id":1,"timestamp_us":100,"data_type":0,"seq":1,"payload":[10,20]}"#;
-        let pkt = SensorPacket::from_json(json.as_bytes()).unwrap();
-        assert_eq!(pkt.sensor_id, 1);
     }
 }

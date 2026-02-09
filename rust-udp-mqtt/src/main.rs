@@ -1,18 +1,19 @@
 mod config;
-mod mqtt_publisher;
 mod sensor;
 mod stats;
-mod udp_receiver;
+mod vad;
+mod transport_udp;
+mod transport_tcp;
+mod transport_mqtt;
 
 use clap::Parser;
-use config::Config;
+use config::{ Config, Transport };
 use stats::Stats;
 use tokio::sync::mpsc;
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize structured logging
     tracing_subscriber
         ::fmt()
         .with_env_filter(
@@ -28,41 +29,76 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
 
     info!(
-        udp_addr = config.udp_addr(),
-        mqtt = format!("{}:{}", config.mqtt_host, config.mqtt_port),
-        udp_threads = config.resolved_udp_threads(),
+        transport = %config.transport,
+        listen = config.listen_addr(),
+        recv_threads = config.resolved_recv_threads(),
+        proc_threads = config.resolved_proc_threads(),
         channel_cap = config.channel_capacity,
         "🚀 vad-sensor-bridge starting"
     );
 
-    // Lock-free stats counters
     let stats = Stats::new();
 
-    // Bounded MPSC channel: UDP receivers → MQTT publisher
+    // Channel: transport receivers → VAD processors
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
     // Spawn stats reporter
+    let transport_name = config.transport.to_string();
     let stats_clone = stats.clone();
     let stats_interval = config.stats_interval_secs;
     tokio::spawn(async move {
-        stats::stats_reporter(stats_clone, stats_interval).await;
+        stats::stats_reporter(stats_clone, stats_interval, &transport_name).await;
     });
 
-    // Spawn MQTT publisher (must start before UDP so channel is ready)
-    let (_pub_handle, _el_handle) = mqtt_publisher::spawn_mqtt_publisher(
-        &config,
-        rx,
-        stats.clone()
-    ).await?;
+    // Spawn VAD processor workers
+    let proc_threads = config.resolved_proc_threads();
+    let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+    for i in 0..proc_threads {
+        let rx = rx.clone();
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            loop {
+                let packet = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                match packet {
+                    Some(pkt) => {
+                        let result = vad::compute_vad(&pkt);
+                        stats.record_processed(result.is_active);
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+            tracing::debug!(worker = i, "VAD processor stopped");
+        });
+    }
 
-    // Spawn UDP receivers (multi-thread with SO_REUSEPORT)
-    let udp_handles = udp_receiver::spawn_udp_receivers(&config, tx, stats.clone()).await?;
-
-    info!("✅ All systems go — listening for sensor data");
-
-    // Wait for any task to finish (shouldn't happen normally)
-    for h in udp_handles {
-        h.await?;
+    // Spawn transport-specific receivers
+    match config.transport {
+        Transport::Udp => {
+            let handles = transport_udp::spawn_udp_receivers(&config, tx, stats.clone()).await?;
+            info!("✅ All systems go — listening for sensor data via UDP");
+            for h in handles {
+                h.await?;
+            }
+        }
+        Transport::Tcp => {
+            let handle = transport_tcp::spawn_tcp_receiver(&config, tx, stats.clone()).await?;
+            info!("✅ All systems go — listening for sensor data via TCP");
+            handle.await?;
+        }
+        Transport::Mqtt => {
+            let (handle, _) = transport_mqtt::spawn_mqtt_subscriber(
+                &config,
+                tx,
+                stats.clone()
+            ).await?;
+            info!("✅ All systems go — listening for sensor data via MQTT");
+            handle.await?;
+        }
     }
 
     Ok(())
