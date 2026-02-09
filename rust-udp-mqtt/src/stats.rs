@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{ AtomicU64, Ordering };
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{ Duration, Instant };
 
 /// Lock-free performance counters
 #[derive(Debug)]
@@ -108,7 +108,7 @@ pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64) {
             snap.mqtt_mps,
             snap.parse_errors,
             snap.mqtt_errors,
-            snap.channel_drops,
+            snap.channel_drops
         );
     }
 }

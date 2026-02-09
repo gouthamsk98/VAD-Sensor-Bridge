@@ -5,8 +5,8 @@
  *
  * Architecture:
  *   N UDP receiver threads (SO_REUSEPORT)
- *     → per-thread lock-free ring buffer
- *       → 1 MQTT publisher thread (paho.mqtt.c)
+ *     → shared lock-free MPSC ring buffer
+ *       → M MQTT publisher threads (paho.mqtt.c)
  *
  * Build: see Makefile
  * Deps:  libpaho-mqtt3a (async client), pthreads
@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -33,16 +34,19 @@
 #include "ring_buffer.h"
 
 /* ─── Configuration defaults ─────────────────────────────────────── */
-#define DEFAULT_UDP_PORT       9000
-#define DEFAULT_MQTT_HOST      "127.0.0.1"
-#define DEFAULT_MQTT_PORT      1883
-#define DEFAULT_TOPIC_PREFIX   "vad/sensors"
-#define DEFAULT_CLIENT_ID      "vad-c-bridge"
-#define DEFAULT_RING_CAPACITY  65536
-#define DEFAULT_RECV_BUF       (4 * 1024 * 1024)
-#define DEFAULT_STATS_INTERVAL 5
-#define MAX_UDP_THREADS        32
-#define MAX_DATAGRAM           65535
+#define DEFAULT_UDP_PORT        9000
+#define DEFAULT_MQTT_HOST       "127.0.0.1"
+#define DEFAULT_MQTT_PORT       1883
+#define DEFAULT_TOPIC_PREFIX    "vad/sensors"
+#define DEFAULT_CLIENT_ID       "vad-c-bridge"
+#define DEFAULT_RING_CAPACITY   262144
+#define DEFAULT_RECV_BUF        (4 * 1024 * 1024)
+#define DEFAULT_STATS_INTERVAL  5
+#define DEFAULT_UDP_THREADS     4
+#define DEFAULT_MQTT_THREADS    1
+#define MAX_UDP_THREADS         32
+#define MAX_MQTT_THREADS        8
+#define MAX_DATAGRAM            65535
 
 /* ─── Global state ───────────────────────────────────────────────── */
 static volatile sig_atomic_t g_running   = 1;
@@ -54,14 +58,15 @@ typedef struct {
     int                udp_port;
     int                recv_buf_size;
     const char        *topic_prefix;
-    ring_buffer_t     *ring;
+    ring_buffer_t     *ring;        /* shared ring — MPSC safe */
 } udp_thread_ctx_t;
 
 typedef struct {
+    int                thread_id;
     MQTTAsync          client;
-    ring_buffer_t     *rings;
-    int                n_rings;
+    ring_buffer_t     *ring;        /* shared ring — single consumer uses batch pop */
     int                stats_interval;
+    int                is_stats_owner; /* only thread 0 prints stats */
 } mqtt_thread_ctx_t;
 
 /* ─── Signal handler ─────────────────────────────────────────────── */
@@ -179,66 +184,48 @@ static void *mqtt_publisher_thread(void *arg)
 {
     mqtt_thread_ctx_t *ctx = (mqtt_thread_ctx_t *)arg;
 
-    printf("[MQTT] Publisher thread started, draining %d ring(s)\n",
-           ctx->n_rings);
+    printf("[MQTT-%d] Publisher thread started\n", ctx->thread_id);
 
-    ring_slot_t slot;
+    ring_slot_t batch[RING_BATCH_MAX];
     struct timespec ts_last, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_last);
 
-    uint64_t spin_count = 0;
-
     while (g_running) {
-        int got_any = 0;
+        /* Batch dequeue from the shared MPSC ring */
+        int n = ring_pop_batch(ctx->ring, batch, RING_BATCH_MAX);
 
-        /* Round-robin drain all per-thread rings */
-        for (int i = 0; i < ctx->n_rings; i++) {
-            if (ring_try_pop(&ctx->rings[i], &slot) == 0) {
-                got_any = 1;
-
-                /* Extract topic and payload from slot */
-                char topic[256];
-                memcpy(topic, slot.data, slot.topic_len);
-                topic[slot.topic_len] = '\0';
-
-                /* Fire-and-forget QoS 0 publish */
-                MQTTAsync_message msg = MQTTAsync_message_initializer;
-                msg.payload    = slot.data + slot.topic_len;
-                msg.payloadlen = slot.payload_len;
-                msg.qos        = 0;
-                msg.retained   = 0;
-
-                MQTTAsync_responseOptions resp = MQTTAsync_responseOptions_initializer;
-                int rc = MQTTAsync_sendMessage(ctx->client, topic, &msg, &resp);
-                if (rc == MQTTASYNC_SUCCESS) {
-                    stats_record_mqtt_publish(&g_stats);
-                } else {
-                    stats_record_mqtt_error(&g_stats);
-                    /* Log first few errors to help debug */
-                    static _Atomic int err_logged = 0;
-                    if (atomic_fetch_add(&err_logged, 1) < 5)
-                        printf("[MQTT] sendMessage rc=%d for topic=%s\n", rc, topic);
-                }
-            }
+        if (n == 0) {
+            /* Ring empty — yield CPU instead of busy-spinning with nanosleep.
+             * sched_yield() is much faster to wake up than nanosleep(100µs). */
+            sched_yield();
+            continue;
         }
 
-        if (!got_any) {
-            /* Busy-wait with backoff to keep latency low */
-            spin_count++;
-            if (spin_count > 1000) {
-                /* Yield after sustained empty spins */
-                struct timespec ts = {0, 100000}; /* 100µs */
-                nanosleep(&ts, NULL);
-                spin_count = 0;
+        /* Publish the entire batch */
+        for (int i = 0; i < n; i++) {
+            ring_slot_t *slot = &batch[i];
+
+            char topic[256];
+            memcpy(topic, slot->data, slot->topic_len);
+            topic[slot->topic_len] = '\0';
+
+            int rc = MQTTAsync_send(ctx->client, topic,
+                                    slot->payload_len,
+                                    slot->data + slot->topic_len,
+                                    0 /* qos */, 0 /* retained */, NULL);
+            if (rc == MQTTASYNC_SUCCESS) {
+                stats_record_mqtt_publish(&g_stats);
             } else {
-                __builtin_ia32_pause(); /* x86 PAUSE instruction */
+                stats_record_mqtt_error(&g_stats);
+                static _Atomic int err_logged = 0;
+                if (atomic_fetch_add(&err_logged, 1) < 5)
+                    printf("[MQTT-%d] sendMessage rc=%d for topic=%s\n",
+                           ctx->thread_id, rc, topic);
             }
-        } else {
-            spin_count = 0;
         }
 
-        /* Periodic stats */
-        if (ctx->stats_interval > 0) {
+        /* Periodic stats (only from thread 0) */
+        if (ctx->is_stats_owner && ctx->stats_interval > 0) {
             clock_gettime(CLOCK_MONOTONIC, &ts_now);
             double elapsed = (ts_now.tv_sec - ts_last.tv_sec) +
                              (ts_now.tv_nsec - ts_last.tv_nsec) / 1e9;
@@ -249,7 +236,7 @@ static void *mqtt_publisher_thread(void *arg)
         }
     }
 
-    printf("[MQTT] Publisher thread stopped\n");
+    printf("[MQTT-%d] Publisher thread stopped\n", ctx->thread_id);
     return NULL;
 }
 
@@ -260,12 +247,14 @@ static void usage(const char *prog) {
            "  --mqtt-host H      MQTT broker host (default %s)\n"
            "  --mqtt-port N      MQTT broker port (default %d)\n"
            "  --topic-prefix P   MQTT topic prefix (default %s)\n"
-           "  --threads N        UDP receiver threads (default: nproc)\n"
+           "  --threads N        UDP receiver threads (default %d)\n"
+           "  --mqtt-threads N   MQTT publisher threads (default %d)\n"
            "  --ring-cap N       Ring buffer capacity (default %d)\n"
            "  --stats-interval N Stats print interval secs (default %d, 0=off)\n"
            "  --help             Show this help\n",
            prog, DEFAULT_UDP_PORT, DEFAULT_MQTT_HOST, DEFAULT_MQTT_PORT,
-           DEFAULT_TOPIC_PREFIX, DEFAULT_RING_CAPACITY, DEFAULT_STATS_INTERVAL);
+           DEFAULT_TOPIC_PREFIX, DEFAULT_UDP_THREADS, DEFAULT_MQTT_THREADS,
+           DEFAULT_RING_CAPACITY, DEFAULT_STATS_INTERVAL);
 }
 
 int main(int argc, char *argv[])
@@ -274,7 +263,8 @@ int main(int argc, char *argv[])
     const char *mqtt_host      = DEFAULT_MQTT_HOST;
     int         mqtt_port      = DEFAULT_MQTT_PORT;
     const char *topic_prefix   = DEFAULT_TOPIC_PREFIX;
-    int         n_threads      = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int         n_threads      = DEFAULT_UDP_THREADS;
+    int         n_mqtt_threads = DEFAULT_MQTT_THREADS;
     int         ring_cap       = DEFAULT_RING_CAPACITY;
     int         recv_buf       = DEFAULT_RECV_BUF;
     int         stats_interval = DEFAULT_STATS_INTERVAL;
@@ -291,6 +281,8 @@ int main(int argc, char *argv[])
             topic_prefix = argv[++i];
         else if (!strcmp(argv[i], "--threads") && i+1 < argc)
             n_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mqtt-threads") && i+1 < argc)
+            n_mqtt_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ring-cap") && i+1 < argc)
             ring_cap = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stats-interval") && i+1 < argc)
@@ -303,14 +295,17 @@ int main(int argc, char *argv[])
 
     if (n_threads < 1) n_threads = 1;
     if (n_threads > MAX_UDP_THREADS) n_threads = MAX_UDP_THREADS;
+    if (n_mqtt_threads < 1) n_mqtt_threads = 1;
+    if (n_mqtt_threads > MAX_MQTT_THREADS) n_mqtt_threads = MAX_MQTT_THREADS;
 
     printf("=== vad-sensor-bridge (C) ===\n");
-    printf("UDP port:       %d\n", udp_port);
-    printf("MQTT broker:    %s:%d\n", mqtt_host, mqtt_port);
-    printf("Topic prefix:   %s\n", topic_prefix);
-    printf("UDP threads:    %d\n", n_threads);
-    printf("Ring capacity:  %d\n", ring_cap);
-    printf("Stats interval: %ds\n", stats_interval);
+    printf("UDP port:        %d\n", udp_port);
+    printf("MQTT broker:     %s:%d\n", mqtt_host, mqtt_port);
+    printf("Topic prefix:    %s\n", topic_prefix);
+    printf("UDP threads:     %d\n", n_threads);
+    printf("MQTT threads:    %d\n", n_mqtt_threads);
+    printf("Ring capacity:   %d\n", ring_cap);
+    printf("Stats interval:  %ds\n", stats_interval);
 
     /* Setup signal handlers */
     signal(SIGINT,  sig_handler);
@@ -319,13 +314,11 @@ int main(int argc, char *argv[])
     /* Init stats */
     stats_init(&g_stats);
 
-    /* Create per-thread ring buffers */
-    ring_buffer_t *rings = (ring_buffer_t *)calloc(n_threads, sizeof(ring_buffer_t));
-    for (int i = 0; i < n_threads; i++) {
-        if (ring_init(&rings[i], ring_cap) != 0) {
-            fprintf(stderr, "Failed to allocate ring buffer %d\n", i);
-            return 1;
-        }
+    /* Create single shared MPSC ring buffer */
+    ring_buffer_t ring;
+    if (ring_init(&ring, ring_cap) != 0) {
+        fprintf(stderr, "Failed to allocate ring buffer\n");
+        return 1;
     }
 
     /* ── MQTT client setup ── */
@@ -335,7 +328,7 @@ int main(int argc, char *argv[])
     MQTTAsync client;
     MQTTAsync_createOptions create_opts = MQTTAsync_createOptions_initializer;
     create_opts.sendWhileDisconnected = 1;
-    create_opts.maxBufferedMessages   = 65536;
+    create_opts.maxBufferedMessages   = 1000000; /* large enough for sustained 50k+/s */
 
     int rc = MQTTAsync_createWithOptions(&client, mqtt_uri, DEFAULT_CLIENT_ID,
                                           MQTTCLIENT_PERSISTENCE_NONE, NULL,
@@ -374,37 +367,39 @@ int main(int argc, char *argv[])
     udp_thread_ctx_t udp_ctxs[MAX_UDP_THREADS];
 
     for (int i = 0; i < n_threads; i++) {
-        udp_ctxs[i].thread_id    = i;
-        udp_ctxs[i].udp_port     = udp_port;
+        udp_ctxs[i].thread_id     = i;
+        udp_ctxs[i].udp_port      = udp_port;
         udp_ctxs[i].recv_buf_size = recv_buf;
-        udp_ctxs[i].topic_prefix = topic_prefix;
-        udp_ctxs[i].ring         = &rings[i];
+        udp_ctxs[i].topic_prefix  = topic_prefix;
+        udp_ctxs[i].ring          = &ring;   /* shared MPSC ring */
 
         pthread_create(&udp_tids[i], NULL, udp_receiver_thread, &udp_ctxs[i]);
 
         /* Pin thread to CPU core for cache locality */
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(i % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+        CPU_SET(i % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
         pthread_setaffinity_np(udp_tids[i], sizeof(cpuset), &cpuset);
     }
 
-    /* ── Spawn MQTT publisher thread ── */
-    pthread_t mqtt_tid;
-    mqtt_thread_ctx_t mqtt_ctx;
-    mqtt_ctx.client         = client;
-    mqtt_ctx.rings          = rings;
-    mqtt_ctx.n_rings        = n_threads;
-    mqtt_ctx.stats_interval = stats_interval;
+    /* ── Spawn MQTT publisher threads ── */
+    pthread_t mqtt_tids[MAX_MQTT_THREADS];
+    mqtt_thread_ctx_t mqtt_ctxs[MAX_MQTT_THREADS];
 
-    pthread_create(&mqtt_tid, NULL, mqtt_publisher_thread, &mqtt_ctx);
+    for (int i = 0; i < n_mqtt_threads; i++) {
+        mqtt_ctxs[i].thread_id      = i;
+        mqtt_ctxs[i].client         = client;
+        mqtt_ctxs[i].ring           = &ring;   /* shared MPSC ring */
+        mqtt_ctxs[i].stats_interval = stats_interval;
+        mqtt_ctxs[i].is_stats_owner = (i == 0); /* only thread 0 prints stats */
 
-    /* Pin MQTT thread to a dedicated core */
-    {
+        pthread_create(&mqtt_tids[i], NULL, mqtt_publisher_thread, &mqtt_ctxs[i]);
+
+        /* Pin MQTT threads to cores after UDP threads */
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(n_threads % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
-        pthread_setaffinity_np(mqtt_tid, sizeof(cpuset), &cpuset);
+        CPU_SET((n_threads + i) % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+        pthread_setaffinity_np(mqtt_tids[i], sizeof(cpuset), &cpuset);
     }
 
     printf("✅ All systems go — listening for sensor data\n");
@@ -412,7 +407,8 @@ int main(int argc, char *argv[])
     /* ── Wait for shutdown ── */
     for (int i = 0; i < n_threads; i++)
         pthread_join(udp_tids[i], NULL);
-    pthread_join(mqtt_tid, NULL);
+    for (int i = 0; i < n_mqtt_threads; i++)
+        pthread_join(mqtt_tids[i], NULL);
 
     /* Cleanup */
     MQTTAsync_disconnectOptions disc_opts = MQTTAsync_disconnectOptions_initializer;
@@ -420,9 +416,7 @@ int main(int argc, char *argv[])
     MQTTAsync_disconnect(client, &disc_opts);
     MQTTAsync_destroy(&client);
 
-    for (int i = 0; i < n_threads; i++)
-        ring_destroy(&rings[i]);
-    free(rings);
+    ring_destroy(&ring);
 
     printf("Shutdown complete.\n");
     return 0;
