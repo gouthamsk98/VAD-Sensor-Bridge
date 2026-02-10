@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 match packet {
                     Some(pkt) => {
-                        let result = vad::compute_vad(&pkt);
+                        let result = vad::process_packet(&pkt);
                         stats.record_processed(result.is_active);
                     }
                     None => {

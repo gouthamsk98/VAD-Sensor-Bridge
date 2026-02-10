@@ -316,8 +316,8 @@ static void *vad_processor_thread(void *arg)
             continue;
         }
 
-        /* Compute VAD */
-        vad_result_t result = vad_compute(&pkt);
+        /* Compute VAD (audio or emotional, routed by data_type) */
+        vad_result_t result = vad_process(&pkt);
         stats_record_processed(&g_stats, result.is_active);
     }
 
