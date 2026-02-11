@@ -65,6 +65,31 @@ async fn main() -> anyhow::Result<()> {
                 match packet {
                     Some(pkt) => {
                         let result = vad::process_packet(&pkt);
+                        match result.kind {
+                            vad::VadKind::Audio => {
+                                info!(
+                                    sensor_id = result.sensor_id,
+                                    seq = result.seq,
+                                    kind = "audio",
+                                    is_active = result.is_active,
+                                    energy = format!("{:.2}", result.energy),
+                                    threshold = format!("{:.2}", result.threshold),
+                                    "🎙️  VAD result"
+                                );
+                            }
+                            vad::VadKind::Emotional => {
+                                info!(
+                                    sensor_id = result.sensor_id,
+                                    seq = result.seq,
+                                    kind = "emotional",
+                                    is_active = result.is_active,
+                                    valence = format!("{:.3}", result.valence),
+                                    arousal = format!("{:.3}", result.arousal),
+                                    dominance = format!("{:.3}", result.dominance),
+                                    "💡 VAD result"
+                                );
+                            }
+                        }
                         stats.record_processed(result.is_active);
                     }
                     None => {
