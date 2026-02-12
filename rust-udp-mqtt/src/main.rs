@@ -1,7 +1,9 @@
 mod config;
+mod esp_audio_protocol;
 mod sensor;
 mod stats;
 mod vad;
+mod vad_response;
 mod transport_udp;
 mod transport_tcp;
 mod transport_mqtt;
@@ -42,6 +44,9 @@ async fn main() -> anyhow::Result<()> {
     // Channel: transport receivers → VAD processors
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
+    // Channel: VAD processors → response senders
+    let (vad_tx, vad_rx) = mpsc::channel(config.channel_capacity);
+
     // Spawn stats reporter
     let transport_name = config.transport.to_string();
     let stats_clone = stats.clone();
@@ -53,9 +58,11 @@ async fn main() -> anyhow::Result<()> {
     // Spawn VAD processor workers
     let proc_threads = config.resolved_proc_threads();
     let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+    let vad_tx_clone = vad_tx.clone();
     for i in 0..proc_threads {
         let rx = rx.clone();
         let stats = stats.clone();
+        let vad_tx = vad_tx_clone.clone();
         tokio::spawn(async move {
             loop {
                 let packet = {
@@ -91,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         stats.record_processed(result.is_active);
+                        let _ = vad_tx.try_send(result);
                     }
                     None => {
                         break;
@@ -101,10 +109,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Spawn transport-specific receivers
+    // Spawn transport-specific receivers and response handlers
     match config.transport {
         Transport::Udp => {
-            let handles = transport_udp::spawn_udp_receivers(&config, tx, stats.clone()).await?;
+            let handles = transport_udp::spawn_udp_receivers(
+                &config,
+                tx,
+                vad_rx,
+                stats.clone()
+            ).await?;
             info!("✅ All systems go — listening for sensor data via UDP");
             for h in handles {
                 h.await?;

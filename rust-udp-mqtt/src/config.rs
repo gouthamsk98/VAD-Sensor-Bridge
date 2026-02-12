@@ -33,6 +33,14 @@ pub struct Config {
     #[arg(long, default_value_t = 9000)]
     pub port: u16,
 
+    /// UDP audio stream port (receives audio, returns VAD results)
+    #[arg(long, default_value_t = 9001)]
+    pub audio_port: u16,
+
+    /// UDP sensor value port (receives sensor values, returns VAD results)
+    #[arg(long, default_value_t = 9002)]
+    pub sensor_port: u16,
+
     /// MQTT broker host (for mqtt transport)
     #[arg(long, default_value = "127.0.0.1")]
     pub mqtt_host: String,
@@ -68,11 +76,23 @@ pub struct Config {
     /// Stats logging interval in seconds (0 = disabled)
     #[arg(long, default_value_t = 5)]
     pub stats_interval_secs: u64,
+
+    /// Directory to save ESP audio session recordings
+    #[arg(long, default_value = "../esp_audio")]
+    pub audio_save_dir: String,
 }
 
 impl Config {
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    pub fn audio_addr(&self) -> String {
+        format!("{}:{}", self.host, self.audio_port)
+    }
+
+    pub fn sensor_addr(&self) -> String {
+        format!("{}:{}", self.host, self.sensor_port)
     }
 
     pub fn resolved_recv_threads(&self) -> usize {

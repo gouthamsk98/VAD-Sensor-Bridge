@@ -12,3 +12,4 @@ bench/results/*.log
 # OS
 .DS_Store
 Thumbs.db
+esp_audio/
