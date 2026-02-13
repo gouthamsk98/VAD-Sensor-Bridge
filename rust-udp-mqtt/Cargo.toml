@@ -18,13 +18,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # TTY detection for ANSI color control
 atty = "0.2"
 # CLI args
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 # Byte manipulation
 bytes = "1"
 # Socket options (SO_REUSEPORT)
 socket2 = { version = "0.5", features = ["all"] }
 # Error handling
 anyhow = "1"
+# WebSocket client (OpenAI Realtime API)
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+# Async stream utilities (for WS split)
+futures-util = "0.3"
+# Base64 encoding for audio chunks
+base64 = "0.22"
+# URL parsing
+url = "2"
+# HTTP client (for future REST calls)
+http = "1"
 
 [profile.release]
 opt-level = 3

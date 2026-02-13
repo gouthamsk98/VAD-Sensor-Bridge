@@ -80,6 +80,28 @@ pub struct Config {
     /// Directory to save ESP audio session recordings
     #[arg(long, default_value = "../esp_audio")]
     pub audio_save_dir: String,
+
+    // ── OpenAI Realtime API ────────────────────────────────────────────
+
+    /// Enable OpenAI Realtime API bridge (streams ESP audio to OpenAI and back)
+    #[arg(long, default_value_t = false)]
+    pub openai_realtime: bool,
+
+    /// OpenAI API key (or set OPENAI_API_KEY env var)
+    #[arg(long, env = "OPENAI_API_KEY", default_value = "")]
+    pub openai_api_key: String,
+
+    /// OpenAI Realtime model name
+    #[arg(long, default_value = "gpt-4o-realtime-preview-2024-12-17")]
+    pub openai_model: String,
+
+    /// OpenAI Realtime voice (alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar)
+    #[arg(long, default_value = "sage")]
+    pub openai_voice: String,
+
+    /// System instructions for the OpenAI Realtime session
+    #[arg(long, default_value = "You are a helpful voice assistant. Respond concisely.")]
+    pub openai_instructions: String,
 }
 
 impl Config {

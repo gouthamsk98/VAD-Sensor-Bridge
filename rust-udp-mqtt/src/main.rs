@@ -7,6 +7,7 @@ mod vad_response;
 mod transport_udp;
 mod transport_tcp;
 mod transport_mqtt;
+mod transport_openai;
 
 use clap::Parser;
 use config::{ Config, Transport };
