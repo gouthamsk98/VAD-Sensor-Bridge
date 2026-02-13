@@ -242,19 +242,19 @@ async fn esp_audio_recv_loop(
                             Ok(()) => {
                                 debug!(
                                     src = %src, seq = pkt.seq_num, bytes = payload_len,
-                                    "🔄 audio forwarded to OpenAI tx"
+                                    "audio forwarded to OpenAI tx"
                                 );
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 warn!(
                                     src = %src,
-                                    "⚠️ OpenAI tx channel full — dropping audio chunk"
+                                    "OpenAI tx channel full — dropping audio chunk"
                                 );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 warn!(
                                     src = %src,
-                                    "⚠️ OpenAI tx channel closed — session may have ended"
+                                    "OpenAI tx channel closed — session may have ended"
                                 );
                             }
                         }
@@ -367,7 +367,8 @@ async fn handle_esp_control(
             // active_esp gets overwritten on the next SESSION_START.
             if let Some(ref oai) = persistent_oai {
                 oai.commit_input_buffer().await;
-                info!(src = %src, "📝 committed OpenAI audio buffer on session end");
+                oai.create_response().await;
+                info!(src = %src, "📝 committed OpenAI audio buffer + triggered response on session end");
             }
 
             if let Some((audio_buf, pkts, bytes, lost, duration)) = session_data {

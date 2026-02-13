@@ -75,6 +75,18 @@ impl OpenAiSession {
         info!("📝 input_audio_buffer.commit sent to OpenAI");
     }
 
+    /// Explicitly trigger a response from OpenAI.
+    ///
+    /// With `server_vad`, responses are normally triggered automatically
+    /// when silence is detected.  However, if we manually commit the
+    /// buffer (e.g. on SESSION_END) we bypass that auto-trigger and
+    /// must explicitly ask for a response.
+    pub async fn create_response(&self) {
+        let event = json!({"type": "response.create"}).to_string();
+        let _ = self.control_tx.send(tungstenite::Message::Text(event)).await;
+        info!("🗣️ response.create sent to OpenAI");
+    }
+
     /// Set the active ESP client that receives audio responses.
     pub async fn set_active_esp(&self, addr: SocketAddr) {
         *self.active_esp.write().await = Some(addr);
