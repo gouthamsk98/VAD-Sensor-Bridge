@@ -87,6 +87,19 @@ impl OpenAiSession {
         info!("🗣️ response.create sent to OpenAI");
     }
 
+    /// Update the session instructions (prompt) on the fly.
+    pub async fn update_instructions(&self, instructions: &str) {
+        let event =
+            json!({
+            "type": "session.update",
+            "session": {
+                "instructions": instructions
+            }
+        }).to_string();
+        let _ = self.control_tx.send(tungstenite::Message::Text(event)).await;
+        info!(len = instructions.len(), "🧭 session.update sent (instructions)");
+    }
+
     /// Set the active ESP client that receives audio responses.
     pub async fn set_active_esp(&self, addr: SocketAddr) {
         *self.active_esp.write().await = Some(addr);

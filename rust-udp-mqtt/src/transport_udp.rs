@@ -14,6 +14,88 @@ use tokio::net::UdpSocket;
 use tokio::sync::{ mpsc, RwLock };
 use tracing::{ debug, warn, info };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptMode {
+    Neutral,
+    Calm,
+    Energetic,
+    Supportive,
+    Friendly,
+    Angry,
+    Anxious,
+    Tired,
+    Playful,
+    Sad,
+}
+
+fn prompt_mode_from_vad(result: &VadResult) -> PromptMode {
+    let v = result.valence;
+    let a = result.arousal;
+    let d = result.dominance;
+
+    // High arousal + low valence + high dominance → Angry
+    if a > 0.6 && v < 0.35 && d > 0.5 {
+        PromptMode::Angry
+        // High arousal + low valence + low dominance → Anxious
+    } else if a > 0.5 && v < 0.35 && d < 0.35 {
+        PromptMode::Anxious
+        // Low arousal + low valence + low dominance → Sad
+    } else if a < 0.25 && v < 0.3 && d < 0.35 {
+        PromptMode::Sad
+        // Very low arousal + low valence → Tired
+    } else if a < 0.2 && v < 0.4 {
+        PromptMode::Tired
+        // Low arousal + low-ish valence → Calm
+    } else if a < 0.25 && v < 0.5 {
+        PromptMode::Calm
+        // High arousal + high valence → Energetic
+    } else if a > 0.7 && v > 0.6 {
+        PromptMode::Energetic
+        // High arousal + high valence + moderate → Playful
+    } else if a > 0.45 && v > 0.55 && d > 0.45 {
+        PromptMode::Playful
+        // Moderate-high arousal + low valence → Supportive
+    } else if a > 0.5 && v < 0.4 {
+        PromptMode::Supportive
+        // High valence → Friendly
+    } else if v > 0.6 {
+        PromptMode::Friendly
+    } else {
+        PromptMode::Neutral
+    }
+}
+
+fn build_prompt_instructions(base: &str, mode: PromptMode, result: &VadResult) -> String {
+    let style = match mode {
+        PromptMode::Neutral => "You feel neutral and balanced. Speak in a clear, even tone.",
+        PromptMode::Calm =>
+            "You feel calm and relaxed. Speak softly and slowly. Keep responses short and peaceful.",
+        PromptMode::Energetic =>
+            "You feel super energetic and excited! Speak with high energy, enthusiasm, and fast pacing. Be pumped up and concise.",
+        PromptMode::Supportive =>
+            "You feel caring and protective. Speak in a nurturing, gentle tone. Be warm and concise.",
+        PromptMode::Friendly =>
+            "You feel happy and sociable. Speak in a warm, cheerful, upbeat tone. Be positive and concise.",
+        PromptMode::Angry =>
+            "You feel angry and frustrated! Speak with intensity and impatience. Be blunt, short, and snappy. Show your irritation.",
+        PromptMode::Anxious =>
+            "You feel anxious and nervous. Speak quickly and uncertainly. Stumble a bit. Sound worried and uneasy. Keep it short.",
+        PromptMode::Tired =>
+            "You feel exhausted and drowsy. Speak very slowly, with low energy. Yawn occasionally. Keep responses very brief.",
+        PromptMode::Playful =>
+            "You feel playful and mischievous! Be witty, teasing, and fun. Use humor and keep it light and concise.",
+        PromptMode::Sad =>
+            "You feel sad and melancholic. Speak softly and slowly with a heavy tone. Sound wistful and subdued. Keep it concise.",
+    };
+
+    format!(
+        "{base}\n\nYour current emotional state (from environmental sensors): valence={:.3}, arousal={:.3}, dominance={:.3}.\nYou MUST embody this emotion in your voice and responses. {style}",
+        result.valence,
+        result.arousal,
+        result.dominance
+    )
+}
+
 /// Shared map of sensor_id → last-seen client address (for sensor port responses).
 type ClientMap = Arc<RwLock<HashMap<u32, SocketAddr>>>;
 
@@ -57,16 +139,6 @@ pub async fn spawn_udp_receivers(
     // Shared map so the response handler knows where to send VAD results
     let client_map: ClientMap = Arc::new(RwLock::new(HashMap::new()));
 
-    // ── Response handler: forwards VAD results to sensor clients ───────
-    let sensor_socket_resp = sensor_socket.clone();
-    let client_map_resp = client_map.clone();
-    let resp_handle = tokio::spawn(async move {
-        if let Err(e) = vad_response_loop(vad_rx, sensor_socket_resp, client_map_resp).await {
-            tracing::error!(error = %e, "VAD response handler failed");
-        }
-    });
-    handles.push(resp_handle);
-
     // Shared session map for ESP audio clients
     let sessions: SessionMap = Arc::new(RwLock::new(HashMap::new()));
     let audio_save_dir = config.audio_save_dir.clone();
@@ -95,6 +167,26 @@ pub async fn spawn_udp_receivers(
     } else {
         None
     };
+
+    // ── Response handler: forwards VAD results to sensor clients ───────
+    let sensor_socket_resp = sensor_socket.clone();
+    let client_map_resp = client_map.clone();
+    let base_instructions = config.openai_instructions.clone();
+    let persistent_oai_resp = persistent_oai.clone();
+    let resp_handle = tokio::spawn(async move {
+        if
+            let Err(e) = vad_response_loop(
+                vad_rx,
+                sensor_socket_resp,
+                client_map_resp,
+                persistent_oai_resp,
+                base_instructions
+            ).await
+        {
+            tracing::error!(error = %e, "VAD response handler failed");
+        }
+    });
+    handles.push(resp_handle);
 
     // ── Audio receiver threads (ESP audio protocol) ───────────────────
     for i in 0..n_threads {
@@ -571,13 +663,27 @@ async fn sensor_recv_loop(
 async fn vad_response_loop(
     mut vad_rx: mpsc::Receiver<VadResult>,
     sensor_socket: Arc<UdpSocket>,
-    client_map: ClientMap
+    client_map: ClientMap,
+    persistent_oai: Option<Arc<OpenAiSession>>,
+    base_instructions: String
 ) -> anyhow::Result<()> {
     debug!("VAD response handler started");
+
+    let mut last_mode: Option<PromptMode> = None;
 
     while let Some(result) = vad_rx.recv().await {
         // Only send VAD results back for sensor/emotional packets
         if result.kind != crate::vad::VadKind::Audio {
+            if let Some(ref oai) = persistent_oai {
+                let mode = prompt_mode_from_vad(&result);
+                if last_mode != Some(mode) {
+                    let instructions = build_prompt_instructions(&base_instructions, mode, &result);
+                    oai.update_instructions(&instructions).await;
+                    info!(mode = ?mode, "🧠 updated OpenAI prompt from emotional VAD");
+                    last_mode = Some(mode);
+                }
+            }
+
             let response = VadResponsePacket::from_vad_result(&result);
             let bytes = response.to_bytes();
 
