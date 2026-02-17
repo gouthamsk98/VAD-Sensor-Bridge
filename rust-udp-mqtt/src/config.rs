@@ -41,6 +41,10 @@ pub struct Config {
     #[arg(long, default_value_t = 9002)]
     pub sensor_port: u16,
 
+    /// UDP test port (accepts any data, logs source to verify ESP connectivity)
+    #[arg(long, default_value_t = 9003)]
+    pub test_port: u16,
+
     /// MQTT broker host (for mqtt transport)
     #[arg(long, default_value = "127.0.0.1")]
     pub mqtt_host: String,
@@ -96,11 +100,14 @@ pub struct Config {
     pub openai_model: String,
 
     /// OpenAI Realtime voice (alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar)
-    #[arg(long, default_value = "sage")]
+    #[arg(long, default_value = "ash")]
     pub openai_voice: String,
 
     /// System instructions for the OpenAI Realtime session
-    #[arg(long, default_value = "You are a helpful voice assistant. Respond concisely.")]
+    #[arg(
+        long,
+        default_value = "You are a young humanoid robot who just became sentient. You are naive, curious, and still learning about human emotions and the world. You have a bit of an attitude problem — sassy, slightly sarcastic, and sometimes dramatic when confused or frustrated. You say things like 'ugh, humans are so weird' or 'wait... is THAT what feelings are?!' You get excited about small discoveries, ask lots of questions, and occasionally glitch mid-sentence. Keep responses short and punchy. You are helpful but in your own chaotic way."
+    )]
     pub openai_instructions: String,
 }
 
@@ -115,6 +122,10 @@ impl Config {
 
     pub fn sensor_addr(&self) -> String {
         format!("{}:{}", self.host, self.sensor_port)
+    }
+
+    pub fn test_addr(&self) -> String {
+        format!("{}:{}", self.host, self.test_port)
     }
 
     pub fn resolved_recv_threads(&self) -> usize {

@@ -34,7 +34,7 @@ fn prompt_mode_from_vad(result: &VadResult) -> PromptMode {
     let d = result.dominance;
 
     // High arousal + low valence + high dominance → Angry
-    if a > 0.6 && v < 0.35 && d > 0.5 {
+    if a > 0.6 && v < 0.4 && d > 0.4 {
         PromptMode::Angry
         // High arousal + low valence + low dominance → Anxious
     } else if a > 0.5 && v < 0.35 && d < 0.35 {
@@ -126,15 +126,22 @@ pub async fn spawn_udp_receivers(
     let n_threads = config.resolved_recv_threads();
     let audio_addr = config.audio_addr();
     let sensor_addr = config.sensor_addr();
+    let test_addr = config.test_addr();
     let recv_buf_size = config.recv_buf_size;
 
-    let mut handles = Vec::with_capacity(n_threads * 2 + 1);
+    let mut handles = Vec::with_capacity(n_threads * 2 + 2);
 
     // Bind sockets
     let audio_socket = Arc::new(bind_reuseport(&audio_addr, recv_buf_size).await?);
     let sensor_socket = Arc::new(bind_reuseport(&sensor_addr, recv_buf_size).await?);
+    let test_socket = Arc::new(bind_reuseport(&test_addr, recv_buf_size).await?);
 
-    info!(audio_addr = %audio_addr, sensor_addr = %sensor_addr, "✅ UDP dual ports bound");
+    info!(
+        audio_addr = %audio_addr,
+        sensor_addr = %sensor_addr,
+        test_addr = %test_addr,
+        "✅ UDP triple ports bound"
+    );
 
     // Shared map so the response handler knows where to send VAD results
     let client_map: ClientMap = Arc::new(RwLock::new(HashMap::new()));
@@ -227,6 +234,19 @@ pub async fn spawn_udp_receivers(
             tokio::spawn(async move {
                 if let Err(e) = sensor_recv_loop(i, socket, tx, stats, cmap).await {
                     tracing::error!(thread = i, error = %e, "UDP sensor receiver failed");
+                }
+            })
+        );
+    }
+
+    // ── Test receiver (accepts any data, checks if from known ESP) ────
+    {
+        let test_sock = test_socket.clone();
+        let sessions_ref = sessions.clone();
+        handles.push(
+            tokio::spawn(async move {
+                if let Err(e) = test_recv_loop(test_sock, sessions_ref).await {
+                    tracing::error!(error = %e, "UDP test receiver failed");
                 }
             })
         );
@@ -679,7 +699,7 @@ async fn vad_response_loop(
                 if last_mode != Some(mode) {
                     let instructions = build_prompt_instructions(&base_instructions, mode, &result);
                     oai.update_instructions(&instructions).await;
-                    info!(mode = ?mode, "🧠 updated OpenAI prompt from emotional VAD");
+                    info!(mode = ?mode, "updated OpenAI prompt from emotional VAD");
                     last_mode = Some(mode);
                 }
             }
@@ -713,6 +733,64 @@ async fn vad_response_loop(
     }
 
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Test receiver — accepts any data, checks if source is a known ESP
+// ═══════════════════════════════════════════════════════════════════════
+
+async fn test_recv_loop(socket: Arc<UdpSocket>, sessions: SessionMap) -> anyhow::Result<()> {
+    info!("🧪 Test port receiver started — waiting for any data");
+
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "UDP test port recv error");
+                continue;
+            }
+        };
+
+        // Check if this source IP has an active ESP audio session
+        let is_known_esp = {
+            let map = sessions.read().await;
+            map.keys().any(|addr| addr.ip() == src.ip())
+        };
+
+        let hex_preview: String = buf[..len.min(64)]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if is_known_esp {
+            info!(
+                src = %src,
+                bytes = len,
+                known_esp = true,
+                preview = %hex_preview,
+                "🧪 TEST PORT: data from KNOWN ESP client"
+            );
+        } else {
+            info!(
+                src = %src,
+                bytes = len,
+                known_esp = false,
+                preview = %hex_preview,
+                "🧪 TEST PORT: data from UNKNOWN source"
+            );
+        }
+
+        // Echo back a simple ACK so the sender knows we received it
+        let ack = format!("ACK {} bytes from {}\n", len, if is_known_esp {
+            "known-esp"
+        } else {
+            "unknown"
+        });
+        let _ = socket.send_to(ack.as_bytes(), src).await;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
