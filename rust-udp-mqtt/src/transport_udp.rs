@@ -159,7 +159,9 @@ pub async fn spawn_udp_receivers(
             crate::transport_openai::spawn_openai_session(
                 &config,
                 active_esp,
-                audio_socket.clone()
+                audio_socket.clone(),
+                config.save_debug_audio,
+                &config.audio_save_dir
             ).await
         {
             Ok(session) => {

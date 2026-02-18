@@ -91,8 +91,8 @@ pub struct StatsSnapshot {
     pub channel_drops: u64,
 }
 
-/// Background stats reporter task
-pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64, transport_name: &str) {
+/// Background stats reporter task.
+pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64) {
     if interval_secs == 0 {
         std::future::pending::<()>().await;
         return;
@@ -109,7 +109,7 @@ pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64, transport_nam
 
         let snap = stats.snapshot_and_reset(elapsed);
 
-        // Skip logging when nothing is happening
+        // Only log when there's actual activity
         let has_activity =
             snap.recv_pps > 0.0 ||
             snap.proc_pps > 0.0 ||
@@ -120,8 +120,7 @@ pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64, transport_nam
 
         if has_activity {
             println!(
-                "[STATS] {}: {:.0} pps, {:.2} Mbps | VAD: {:.0} proc/s, {} active | errors: parse={} recv={} drops={}",
-                transport_name,
+                "[STATS] {:.0} pps, {:.2} Mbps | VAD: {:.0} proc/s, {} active | errors: parse={} recv={} drops={}",
                 snap.recv_pps,
                 snap.recv_mbps,
                 snap.proc_pps,

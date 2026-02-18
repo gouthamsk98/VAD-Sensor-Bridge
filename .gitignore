@@ -8,7 +8,8 @@ bench/results/*.log
 .idea/
 *.swp
 *.swo
-
+deploy/*
+deploy
 # OS
 .DS_Store
 Thumbs.db

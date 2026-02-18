@@ -25,7 +25,6 @@ use futures_util::{ SinkExt, StreamExt };
 use serde_json::{ json, Value };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{ mpsc, RwLock };
 use tokio_tungstenite::tungstenite;
@@ -132,7 +131,8 @@ pub async fn spawn_openai_session(
     config: &Config,
     active_esp: Arc<RwLock<Option<SocketAddr>>>,
     audio_socket: Arc<UdpSocket>,
-    audio_save_dir: String,
+    save_debug_audio: bool,
+    audio_save_dir: &str
 ) -> anyhow::Result<OpenAiSession> {
     let api_key = config.openai_api_key.clone();
     let model = config.openai_model.clone();
@@ -270,19 +270,23 @@ pub async fn spawn_openai_session(
     //  Reads server events from the WS; when we get audio deltas
     //  we decode + resample 24→16 kHz + packetise as AUDIO_DOWN.
     let active_esp_reader = active_esp.clone();
-    let reader_save_dir = audio_save_dir.clone();
+    let debug_save_dir = format!("{}/debug", audio_save_dir);
     let reader_handle = tokio::spawn(async move {
-        info!("👂 OpenAI reader task started (persistent session)");
+        info!(
+            save_debug_audio = save_debug_audio,
+            "👂 OpenAI reader task started (persistent session)"
+        );
         let mut out_seq: u16 = 0;
         let mut total_audio_deltas: u64 = 0;
         let mut total_audio_bytes_to_esp: u64 = 0;
 
-        // ── TEMPORARY: accumulate OpenAI response audio for debug saving ──
+        // Debug audio accumulator (only active when --save-debug-audio is set)
         let mut response_audio_buf: Vec<u8> = Vec::new();
         let mut response_count: u64 = 0;
-        let debug_dir = format!("{}/debug", reader_save_dir);
-        tokio::fs::create_dir_all(&debug_dir).await.ok();
-        // ── END TEMPORARY ─────────────────────────────────────────────────
+        if save_debug_audio {
+            tokio::fs::create_dir_all(&debug_save_dir).await.ok();
+            info!(dir = %debug_save_dir, "🔴 debug audio saving enabled");
+        }
 
         while let Some(msg_result) = ws_reader.next().await {
             let msg = match msg_result {
@@ -355,16 +359,9 @@ pub async fn spawn_openai_session(
                                 let pcm_16k = resample_24k_to_16k(&pcm_24k);
                                 let n_chunks = pcm_16k.chunks(ESP_MAX_PAYLOAD).len();
 
-                                // ── TEMPORARY: accumulate for debug WAV ──
-                                response_audio_buf.extend_from_slice(&pcm_16k);
-                                let resp_secs = (response_audio_buf.len() as f64) / (16_000.0 * 2.0);
-                                info!(
-                                    pcm_16k_bytes = pcm_16k.len(),
-                                    total_resp_bytes = response_audio_buf.len(),
-                                    resp_audio_secs = format!("{:.2}", resp_secs),
-                                    "🔴 DEBUG: accumulating OpenAI response audio"
-                                );
-                                // ── END TEMPORARY ────────────────────────
+                                if save_debug_audio {
+                                    response_audio_buf.extend_from_slice(&pcm_16k);
+                                }
 
                                 let current_esp = { *active_esp_reader.read().await };
                                 if let Some(esp_addr) = current_esp {
@@ -418,39 +415,39 @@ pub async fn spawn_openai_session(
 
                 "response.audio.done" => {
                     let current_esp = { *active_esp_reader.read().await };
-                    let resp_secs = (response_audio_buf.len() as f64) / (16_000.0 * 2.0);
                     info!(
                         esp = ?current_esp,
                         total_deltas = total_audio_deltas,
                         total_bytes_to_esp = total_audio_bytes_to_esp,
-                        response_audio_bytes = response_audio_buf.len(),
-                        response_audio_secs = format!("{:.2}", resp_secs),
                         "✅ OpenAI audio response complete"
                     );
 
-                    // ── TEMPORARY: save response audio as WAV ──
-                    if !response_audio_buf.is_empty() {
+                    // Save response audio as WAV when debug saving is enabled
+                    if save_debug_audio && !response_audio_buf.is_empty() {
                         response_count += 1;
-                        let ts = std::time::SystemTime::now()
+                        let ts = std::time::SystemTime
+                            ::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
                         let wav_path = format!(
                             "{}/openai_response_{}_{}.wav",
-                            debug_dir, response_count, ts
+                            debug_save_dir,
+                            response_count,
+                            ts
                         );
-                        match save_debug_wav(&wav_path, &response_audio_buf).await {
-                            Ok(()) => info!(
+                        let audio_secs = (response_audio_buf.len() as f64) / (16_000.0 * 2.0);
+                        match write_wav_16k_mono(&wav_path, &response_audio_buf).await {
+                            Ok(()) =>
+                                info!(
                                 path = %wav_path,
-                                bytes = response_audio_buf.len(),
-                                audio_secs = format!("{:.2}", resp_secs),
-                                "🔴 DEBUG: saved OpenAI response audio as WAV"
+                                audio_secs = format!("{:.2}", audio_secs),
+                                "💾 saved OpenAI response audio"
                             ),
                             Err(e) => warn!(error = %e, "failed to save OpenAI response WAV"),
                         }
                         response_audio_buf.clear();
                     }
-                    // ── END TEMPORARY ────────────────────────────────────
 
                     if let Some(esp_addr) = current_esp {
                         let pkt = build_control(out_seq, CTRL_STREAM_END, 0);
@@ -534,11 +531,11 @@ pub async fn spawn_openai_session(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  TEMPORARY: Debug WAV writer for response audio
+//  WAV writer (16 kHz, 16-bit, mono)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Save raw 16 kHz 16-bit mono PCM data as a WAV file (for debug).
-async fn save_debug_wav(path: &str, pcm_data: &[u8]) -> anyhow::Result<()> {
+/// Write raw 16 kHz 16-bit mono PCM data as a WAV file.
+async fn write_wav_16k_mono(path: &str, pcm_data: &[u8]) -> anyhow::Result<()> {
     let data_len = pcm_data.len() as u32;
     let sample_rate: u32 = 16_000;
     let bits_per_sample: u16 = 16;

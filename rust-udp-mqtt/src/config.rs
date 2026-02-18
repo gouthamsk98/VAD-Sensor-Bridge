@@ -1,75 +1,39 @@
-use clap::{ Parser, ValueEnum };
+use clap::Parser;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Transport {
-    Udp,
-    Tcp,
-    Mqtt,
-}
-
-impl std::fmt::Display for Transport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Transport::Udp => write!(f, "UDP"),
-            Transport::Tcp => write!(f, "TCP"),
-            Transport::Mqtt => write!(f, "MQTT"),
-        }
-    }
-}
-
-/// High-performance multi-transport sensor data processor with VAD computation
+/// High-performance UDP sensor data processor with VAD computation
+/// and OpenAI Realtime API bridge for ESP32 audio.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about)]
 pub struct Config {
-    /// Input transport: udp, tcp, or mqtt
-    #[arg(long, value_enum, default_value_t = Transport::Udp)]
-    pub transport: Transport,
-
-    /// Listen address for UDP/TCP
+    /// Listen address
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
 
-    /// Listen port for UDP/TCP
+    /// Base port (unused directly — audio/sensor/test ports below)
     #[arg(long, default_value_t = 9000)]
     pub port: u16,
 
-    /// UDP audio stream port (receives audio, returns VAD results)
+    /// UDP audio stream port (ESP audio protocol)
     #[arg(long, default_value_t = 9001)]
     pub audio_port: u16,
 
-    /// UDP sensor value port (receives sensor values, returns VAD results)
+    /// UDP sensor value port (sensor vectors → VAD results)
     #[arg(long, default_value_t = 9002)]
     pub sensor_port: u16,
 
-    /// UDP test port (accepts any data, logs source to verify ESP connectivity)
+    /// UDP test port (echo, connectivity check)
     #[arg(long, default_value_t = 9003)]
     pub test_port: u16,
-
-    /// MQTT broker host (for mqtt transport)
-    #[arg(long, default_value = "127.0.0.1")]
-    pub mqtt_host: String,
-
-    /// MQTT broker port
-    #[arg(long, default_value_t = 1883)]
-    pub mqtt_port: u16,
-
-    /// MQTT subscribe topic (for mqtt transport input)
-    #[arg(long, default_value = "vad/sensors/+")]
-    pub mqtt_topic: String,
-
-    /// MQTT client ID
-    #[arg(long, default_value = "vad-processor-rust")]
-    pub mqtt_client_id: String,
 
     /// Size of the internal processing channel
     #[arg(long, default_value_t = 65536)]
     pub channel_capacity: usize,
 
-    /// UDP/TCP receive buffer size (SO_RCVBUF)
+    /// UDP receive buffer size (SO_RCVBUF)
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     pub recv_buf_size: usize,
 
-    /// Number of receiver threads (0 = num CPUs, applies to UDP)
+    /// Number of receiver threads (0 = num CPUs)
     #[arg(long, default_value_t = 4)]
     pub recv_threads: usize,
 
@@ -85,6 +49,10 @@ pub struct Config {
     #[arg(long, default_value = "../esp_audio")]
     pub audio_save_dir: String,
 
+    /// Save debug audio (incoming PCM + OpenAI response WAVs) to audio_save_dir/debug/
+    #[arg(long, default_value_t = false)]
+    pub save_debug_audio: bool,
+
     // ── OpenAI Realtime API ────────────────────────────────────────────
 
     /// Enable OpenAI Realtime API bridge (streams ESP audio to OpenAI and back)
@@ -96,10 +64,10 @@ pub struct Config {
     pub openai_api_key: String,
 
     /// OpenAI Realtime model name
-    #[arg(long, default_value = "gpt-4o-realtime-preview-2024-12-17")]
+    #[arg(long, default_value = "gpt-realtime-mini-2025-10-06")]
     pub openai_model: String,
 
-    /// OpenAI Realtime voice (alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar)
+    /// OpenAI Realtime voice
     #[arg(long, default_value = "ash")]
     pub openai_voice: String,
 

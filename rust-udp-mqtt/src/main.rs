@@ -5,12 +5,10 @@ mod stats;
 mod vad;
 mod vad_response;
 mod transport_udp;
-mod transport_tcp;
-mod transport_mqtt;
 mod transport_openai;
 
 use clap::Parser;
-use config::{ Config, Transport };
+use config::Config;
 use stats::Stats;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -32,7 +30,6 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
 
     info!(
-        transport = %config.transport,
         listen = config.listen_addr(),
         recv_threads = config.resolved_recv_threads(),
         proc_threads = config.resolved_proc_threads(),
@@ -42,18 +39,17 @@ async fn main() -> anyhow::Result<()> {
 
     let stats = Stats::new();
 
-    // Channel: transport receivers → VAD processors
+    // Channel: UDP receivers → VAD processors
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
     // Channel: VAD processors → response senders
     let (vad_tx, vad_rx) = mpsc::channel(config.channel_capacity);
 
     // Spawn stats reporter
-    let transport_name = config.transport.to_string();
     let stats_clone = stats.clone();
     let stats_interval = config.stats_interval_secs;
     tokio::spawn(async move {
-        stats::stats_reporter(stats_clone, stats_interval, &transport_name).await;
+        stats::stats_reporter(stats_clone, stats_interval).await;
     });
 
     // Spawn VAD processor workers
@@ -78,23 +74,20 @@ async fn main() -> anyhow::Result<()> {
                                 info!(
                                     sensor_id = result.sensor_id,
                                     seq = result.seq,
-                                    kind = "audio",
                                     is_active = result.is_active,
                                     energy = format!("{:.2}", result.energy),
-                                    threshold = format!("{:.2}", result.threshold),
-                                    "🎙️  VAD result"
+                                    "🎙️  VAD audio"
                                 );
                             }
                             vad::VadKind::Emotional => {
                                 info!(
                                     sensor_id = result.sensor_id,
                                     seq = result.seq,
-                                    kind = "emotional",
                                     is_active = result.is_active,
                                     valence = format!("{:.3}", result.valence),
                                     arousal = format!("{:.3}", result.arousal),
                                     dominance = format!("{:.3}", result.dominance),
-                                    "💡 VAD result"
+                                    "💡 VAD emotional"
                                 );
                             }
                         }
@@ -110,34 +103,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Spawn transport-specific receivers and response handlers
-    match config.transport {
-        Transport::Udp => {
-            let handles = transport_udp::spawn_udp_receivers(
-                &config,
-                tx,
-                vad_rx,
-                stats.clone()
-            ).await?;
-            info!("✅ All systems go — listening for sensor data via UDP");
-            for h in handles {
-                h.await?;
-            }
-        }
-        Transport::Tcp => {
-            let handle = transport_tcp::spawn_tcp_receiver(&config, tx, stats.clone()).await?;
-            info!("✅ All systems go — listening for sensor data via TCP");
-            handle.await?;
-        }
-        Transport::Mqtt => {
-            let (handle, _) = transport_mqtt::spawn_mqtt_subscriber(
-                &config,
-                tx,
-                stats.clone()
-            ).await?;
-            info!("✅ All systems go — listening for sensor data via MQTT");
-            handle.await?;
-        }
+    // Spawn UDP receivers + response handlers
+    let handles = transport_udp::spawn_udp_receivers(&config, tx, vad_rx, stats.clone()).await?;
+
+    info!("✅ All systems go — listening for sensor data via UDP");
+
+    for h in handles {
+        h.await?;
     }
 
     Ok(())

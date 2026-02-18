@@ -1,5 +1,3 @@
-use serde::{ Deserialize, Serialize };
-
 /// Raw sensor datagram layout (binary, packed, little-endian).
 ///
 /// Wire format (32 bytes fixed header + variable payload):
@@ -7,12 +5,10 @@ use serde::{ Deserialize, Serialize };
 ///   [ payload_len: u16 LE ][ reserved: 2 bytes ][ seq: u64 LE ][ padding: 4 bytes ]
 ///   [ payload: payload_len bytes ]
 ///
-/// For TCP, packets are length-prefixed: [ total_len: u32 LE ][ binary_packet ]
-///
 /// Data types:
 ///   1 = 16-bit LE PCM audio (for audio RMS VAD)
 ///   2 = 10×f32 LE sensor vector (for emotional VAD: Valence-Arousal-Dominance)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SensorPacket {
     pub sensor_id: u32,
     pub timestamp_us: u64,
@@ -156,15 +152,9 @@ impl SensorPacket {
         })
     }
 
-    /// Try JSON parse as fallback (for MQTT text payloads)
-    #[inline]
-    pub fn from_json(buf: &[u8]) -> Option<Self> {
-        serde_json::from_slice(buf).ok()
-    }
-
-    /// Parse: try binary first, then JSON fallback
+    /// Parse a binary sensor packet.
     #[inline]
     pub fn parse(buf: &[u8]) -> Option<Self> {
-        Self::from_binary(buf).or_else(|| Self::from_json(buf))
+        Self::from_binary(buf)
     }
 }
