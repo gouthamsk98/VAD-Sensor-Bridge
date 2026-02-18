@@ -108,16 +108,28 @@ pub async fn stats_reporter(stats: Arc<Stats>, interval_secs: u64, transport_nam
         last = now;
 
         let snap = stats.snapshot_and_reset(elapsed);
-        println!(
-            "[STATS] {}: {:.0} pps, {:.2} Mbps | VAD: {:.0} proc/s, {} active | errors: parse={} recv={} drops={}",
-            transport_name,
-            snap.recv_pps,
-            snap.recv_mbps,
-            snap.proc_pps,
-            snap.vad_active,
-            snap.parse_errors,
-            snap.recv_errors,
-            snap.channel_drops
-        );
+
+        // Skip logging when nothing is happening
+        let has_activity =
+            snap.recv_pps > 0.0 ||
+            snap.proc_pps > 0.0 ||
+            snap.vad_active > 0 ||
+            snap.parse_errors > 0 ||
+            snap.recv_errors > 0 ||
+            snap.channel_drops > 0;
+
+        if has_activity {
+            println!(
+                "[STATS] {}: {:.0} pps, {:.2} Mbps | VAD: {:.0} proc/s, {} active | errors: parse={} recv={} drops={}",
+                transport_name,
+                snap.recv_pps,
+                snap.recv_mbps,
+                snap.proc_pps,
+                snap.vad_active,
+                snap.parse_errors,
+                snap.recv_errors,
+                snap.channel_drops
+            );
+        }
     }
 }

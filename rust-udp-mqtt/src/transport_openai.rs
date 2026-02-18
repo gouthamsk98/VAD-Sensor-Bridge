@@ -25,6 +25,7 @@ use futures_util::{ SinkExt, StreamExt };
 use serde_json::{ json, Value };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{ mpsc, RwLock };
 use tokio_tungstenite::tungstenite;
@@ -130,7 +131,8 @@ impl OpenAiSession {
 pub async fn spawn_openai_session(
     config: &Config,
     active_esp: Arc<RwLock<Option<SocketAddr>>>,
-    audio_socket: Arc<UdpSocket>
+    audio_socket: Arc<UdpSocket>,
+    audio_save_dir: String,
 ) -> anyhow::Result<OpenAiSession> {
     let api_key = config.openai_api_key.clone();
     let model = config.openai_model.clone();
@@ -268,11 +270,19 @@ pub async fn spawn_openai_session(
     //  Reads server events from the WS; when we get audio deltas
     //  we decode + resample 24→16 kHz + packetise as AUDIO_DOWN.
     let active_esp_reader = active_esp.clone();
+    let reader_save_dir = audio_save_dir.clone();
     let reader_handle = tokio::spawn(async move {
         info!("👂 OpenAI reader task started (persistent session)");
         let mut out_seq: u16 = 0;
         let mut total_audio_deltas: u64 = 0;
         let mut total_audio_bytes_to_esp: u64 = 0;
+
+        // ── TEMPORARY: accumulate OpenAI response audio for debug saving ──
+        let mut response_audio_buf: Vec<u8> = Vec::new();
+        let mut response_count: u64 = 0;
+        let debug_dir = format!("{}/debug", reader_save_dir);
+        tokio::fs::create_dir_all(&debug_dir).await.ok();
+        // ── END TEMPORARY ─────────────────────────────────────────────────
 
         while let Some(msg_result) = ws_reader.next().await {
             let msg = match msg_result {
@@ -339,11 +349,22 @@ pub async fn spawn_openai_session(
                 // ── Audio response: stream back to ESP ────────────
                 "response.audio.delta" => {
                     if let Some(b64) = event["delta"].as_str() {
-                        info!(b64_len = b64.len(), "🔊 response.audio.delta received");
+                        info!(b64_len = b64.len(), "🔊 response.audio.delta received from OpenAI");
                         match BASE64.decode(b64) {
                             Ok(pcm_24k) => {
                                 let pcm_16k = resample_24k_to_16k(&pcm_24k);
                                 let n_chunks = pcm_16k.chunks(ESP_MAX_PAYLOAD).len();
+
+                                // ── TEMPORARY: accumulate for debug WAV ──
+                                response_audio_buf.extend_from_slice(&pcm_16k);
+                                let resp_secs = (response_audio_buf.len() as f64) / (16_000.0 * 2.0);
+                                info!(
+                                    pcm_16k_bytes = pcm_16k.len(),
+                                    total_resp_bytes = response_audio_buf.len(),
+                                    resp_audio_secs = format!("{:.2}", resp_secs),
+                                    "🔴 DEBUG: accumulating OpenAI response audio"
+                                );
+                                // ── END TEMPORARY ────────────────────────
 
                                 let current_esp = { *active_esp_reader.read().await };
                                 if let Some(esp_addr) = current_esp {
@@ -353,7 +374,7 @@ pub async fn spawn_openai_session(
                                         n_chunks = n_chunks,
                                         esp = %esp_addr,
                                         seq = out_seq,
-                                        "sending AUDIO_DOWN to ESP"
+                                        "📤 sending AUDIO_DOWN to ESP"
                                     );
 
                                     for chunk in pcm_16k.chunks(ESP_MAX_PAYLOAD) {
@@ -397,12 +418,40 @@ pub async fn spawn_openai_session(
 
                 "response.audio.done" => {
                     let current_esp = { *active_esp_reader.read().await };
+                    let resp_secs = (response_audio_buf.len() as f64) / (16_000.0 * 2.0);
                     info!(
                         esp = ?current_esp,
                         total_deltas = total_audio_deltas,
                         total_bytes_to_esp = total_audio_bytes_to_esp,
-                        "OpenAI audio response complete"
+                        response_audio_bytes = response_audio_buf.len(),
+                        response_audio_secs = format!("{:.2}", resp_secs),
+                        "✅ OpenAI audio response complete"
                     );
+
+                    // ── TEMPORARY: save response audio as WAV ──
+                    if !response_audio_buf.is_empty() {
+                        response_count += 1;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let wav_path = format!(
+                            "{}/openai_response_{}_{}.wav",
+                            debug_dir, response_count, ts
+                        );
+                        match save_debug_wav(&wav_path, &response_audio_buf).await {
+                            Ok(()) => info!(
+                                path = %wav_path,
+                                bytes = response_audio_buf.len(),
+                                audio_secs = format!("{:.2}", resp_secs),
+                                "🔴 DEBUG: saved OpenAI response audio as WAV"
+                            ),
+                            Err(e) => warn!(error = %e, "failed to save OpenAI response WAV"),
+                        }
+                        response_audio_buf.clear();
+                    }
+                    // ── END TEMPORARY ────────────────────────────────────
+
                     if let Some(esp_addr) = current_esp {
                         let pkt = build_control(out_seq, CTRL_STREAM_END, 0);
                         out_seq = out_seq.wrapping_add(1);
@@ -431,17 +480,21 @@ pub async fn spawn_openai_session(
                 // ── Transcripts ───────────────────────────────────
                 "response.audio_transcript.delta" => {
                     if let Some(d) = event["delta"].as_str() {
-                        info!(delta = d, "transcript delta");
+                        debug!(delta = d, "transcript delta");
                     }
                 }
                 "response.audio_transcript.done" => {
                     if let Some(t) = event["transcript"].as_str() {
-                        info!(transcript = t, "AI said");
+                        info!("\n╔══════════════════════════════════════════════╗");
+                        info!("║ 🤖 AI SAID: {}", t);
+                        info!("╚══════════════════════════════════════════════╝");
                     }
                 }
                 "conversation.item.input_audio_transcription.completed" => {
                     if let Some(t) = event["transcript"].as_str() {
-                        info!(transcript = t, "User said");
+                        info!("\n┌──────────────────────────────────────────────┐");
+                        info!("│ 🎤 USER SAID: {}", t);
+                        info!("└──────────────────────────────────────────────┘");
                     }
                 }
 
@@ -478,6 +531,39 @@ pub async fn spawn_openai_session(
         reader_handle,
         writer_handle,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TEMPORARY: Debug WAV writer for response audio
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Save raw 16 kHz 16-bit mono PCM data as a WAV file (for debug).
+async fn save_debug_wav(path: &str, pcm_data: &[u8]) -> anyhow::Result<()> {
+    let data_len = pcm_data.len() as u32;
+    let sample_rate: u32 = 16_000;
+    let bits_per_sample: u16 = 16;
+    let channels: u16 = 1;
+    let byte_rate = sample_rate * ((bits_per_sample as u32) / 8) * (channels as u32);
+    let block_align = channels * (bits_per_sample / 8);
+
+    let mut wav = Vec::with_capacity(44 + pcm_data.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&(16u32).to_le_bytes());
+    wav.extend_from_slice(&(1u16).to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm_data);
+
+    tokio::fs::write(path, &wav).await?;
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════

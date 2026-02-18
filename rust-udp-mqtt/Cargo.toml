@@ -25,6 +25,8 @@ bytes = "1"
 socket2 = { version = "0.5", features = ["all"] }
 # Error handling
 anyhow = "1"
+# Static OpenSSL for musl builds
+openssl = { version = "0.10", features = ["vendored"] }
 # WebSocket client (OpenAI Realtime API)
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 # Async stream utilities (for WS split)
