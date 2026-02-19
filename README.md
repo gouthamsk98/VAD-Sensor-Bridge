@@ -3,6 +3,7 @@
 High-performance **UDP sensor bridge** for an ESP32 robot platform.
 Receives binary sensor packets and ESP audio streams via UDP,
 computes dual-pipeline VAD (audio RMS + emotional Valence-Arousal-Dominance),
+supports **runtime personality traits** that reshape emotional responses,
 and optionally bridges audio to the **OpenAI Realtime API** for
 bidirectional voice conversation.
 
@@ -64,6 +65,72 @@ using fixed weight vectors:
 | motion_energy | 9     | IMU / accelerometer motion energy     |
 
 **Arousal threshold** for `is_active`: 0.35
+
+### Personality Traits
+
+The emotional VAD weights can be modified at runtime by selecting a **personality trait**.
+Each trait applies additive deltas to the base V/A/D weight vectors, shaping how the
+robot _feels_ about the same sensor inputs.
+
+| Trait           | Index | Behaviour                                                                  |
+| --------------- | ----- | -------------------------------------------------------------------------- |
+| **Obedient**    | 0     | Calm, compliant — dampened arousal, boosted dominance (default)            |
+| **Mischievous** | 1     | Playful, chaotic — amplified arousal from sound/motion, lower dominance    |
+| **Cute**        | 2     | Affectionate — boosted valence for social channels, softer threat response |
+| **Stubborn**    | 3     | Defiant — high dominance, reduced social valence, higher threat arousal    |
+
+**Example effect** — ANGRY/FEAR scenario (same sensor inputs):
+
+| Trait       | Valence | Arousal | Dominance | Active? |
+| ----------- | ------- | ------- | --------- | ------- |
+| Obedient    | 0.00    | 0.65    | 0.07      | ✅      |
+| Mischievous | 0.00    | 0.88    | 0.00      | ✅      |
+| Cute        | 0.08    | 0.73    | 0.12      | ✅      |
+| Stubborn    | 0.10    | 0.88    | 0.22      | ✅      |
+
+The active persona is changed at runtime via the REST API (see below).
+
+### REST API
+
+A lightweight HTTP API (axum) runs on `--api-port` (default 8080) for runtime
+personality management.
+
+| Method | Endpoint        | Description                      |
+| ------ | --------------- | -------------------------------- |
+| GET    | `/health`       | Health check (`{"status":"ok"}`) |
+| GET    | `/persona`      | Current active persona + index   |
+| GET    | `/persona/list` | All available personas + current |
+| PUT    | `/persona`      | Change active persona            |
+
+**Set persona by name:**
+
+```bash
+curl -X PUT http://localhost:8080/persona \
+     -H 'Content-Type: application/json' \
+     -d '{"persona": "mischievous"}'
+```
+
+**Set persona by index:**
+
+```bash
+curl -X PUT http://localhost:8080/persona \
+     -H 'Content-Type: application/json' \
+     -d '{"index": 2}'
+```
+
+**Get current persona:**
+
+```bash
+curl http://localhost:8080/persona
+# {"persona":"obedient","index":0}
+```
+
+**List all personas:**
+
+```bash
+curl http://localhost:8080/persona/list
+# {"current":"obedient","available":[{"index":0,"name":"obedient"}, ...]}
+```
 
 ---
 
@@ -216,6 +283,7 @@ python3 bench/test_openai_realtime.py --host <server-ip>
 --audio-port N           ESP audio stream port (default: 9001)
 --sensor-port N          Sensor vector port (default: 9002)
 --test-port N            Test / echo port (default: 9003)
+--api-port N             REST API port for persona management (default: 8080)
 --recv-threads N         Receiver threads (default: 4, 0 = num CPUs)
 --proc-threads N         VAD processor threads (default: 2, 0 = num CPUs)
 --channel-capacity N     Internal channel size (default: 65536)
@@ -339,6 +407,8 @@ vad-api/
 │   └── src/
 │       ├── main.rs                     # Entry point, tokio runtime setup
 │       ├── config.rs                   # CLI config (clap derive)
+│       ├── persona.rs                  # Personality traits + weight deltas
+│       ├── api.rs                      # REST API (axum) for persona management
 │       ├── sensor.rs                   # Binary sensor packet parser
 │       ├── esp_audio_protocol.rs       # ESP32 ↔ Server UDP audio protocol
 │       ├── vad.rs                      # Audio RMS + Emotional V/A/D VAD

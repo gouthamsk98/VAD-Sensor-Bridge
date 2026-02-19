@@ -9,6 +9,10 @@ description = "UDP sensor bridge with VAD + OpenAI Realtime API for ESP32 audio"
 tokio = { version = "1", features = ["full"] }
 # JSON (OpenAI WebSocket events)
 serde_json = "1"
+# Serialisation (persona API)
+serde = { version = "1", features = ["derive"] }
+# HTTP server (persona REST API)
+axum = "0.7"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

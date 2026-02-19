@@ -1,5 +1,7 @@
+mod api;
 mod config;
 mod esp_audio_protocol;
+mod persona;
 mod sensor;
 mod stats;
 mod vad;
@@ -9,6 +11,7 @@ mod transport_openai;
 
 use clap::Parser;
 use config::Config;
+use persona::{ PersonaState, PersonaTrait };
 use stats::Stats;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -39,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
 
     let stats = Stats::new();
 
+    // Shared personality state (changeable via REST API)
+    let persona_state = PersonaState::new(PersonaTrait::Obedient);
+    info!(persona = %PersonaTrait::Obedient, "🎭 Default persona loaded");
+
     // Channel: UDP receivers → VAD processors
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
@@ -60,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         let rx = rx.clone();
         let stats = stats.clone();
         let vad_tx = vad_tx_clone.clone();
+        let persona = persona_state.clone();
         tokio::spawn(async move {
             loop {
                 let packet = {
@@ -68,7 +76,8 @@ async fn main() -> anyhow::Result<()> {
                 };
                 match packet {
                     Some(pkt) => {
-                        let result = vad::process_packet(&pkt);
+                        let active_persona = persona.get_blocking();
+                        let result = vad::process_packet(&pkt, active_persona);
                         match result.kind {
                             vad::VadKind::Audio => {
                                 info!(
@@ -102,6 +111,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!(worker = i, "VAD processor stopped");
         });
     }
+
+    // Spawn REST API server for persona management
+    let _api_handle = api::start_api_server(
+        &config.host,
+        config.api_port,
+        persona_state.clone()
+    ).await?;
 
     // Spawn UDP receivers + response handlers
     let handles = transport_udp::spawn_udp_receivers(&config, tx, vad_rx, stats.clone()).await?;

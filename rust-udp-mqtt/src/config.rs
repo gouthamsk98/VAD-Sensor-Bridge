@@ -25,6 +25,10 @@ pub struct Config {
     #[arg(long, default_value_t = 9003)]
     pub test_port: u16,
 
+    /// REST API port for persona management
+    #[arg(long, default_value_t = 8080)]
+    pub api_port: u16,
+
     /// Size of the internal processing channel
     #[arg(long, default_value_t = 65536)]
     pub channel_capacity: usize,

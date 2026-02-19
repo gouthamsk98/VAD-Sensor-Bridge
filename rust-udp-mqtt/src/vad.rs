@@ -1,3 +1,4 @@
+use crate::persona::{ PersonaTrait, apply_deltas, persona_weight_deltas };
 use crate::sensor::{ SensorPacket, SensorVector, DATA_TYPE_AUDIO, DATA_TYPE_SENSOR_VECTOR };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -42,10 +43,13 @@ pub struct VadResult {
 /// * `data_type == 1` → audio RMS energy VAD
 /// * `data_type == 2` → emotional Valence-Arousal-Dominance VAD
 /// * anything else    → falls back to audio VAD
+///
+/// The `persona` trait applies additive weight deltas to the emotional
+/// VAD weights, shaping the robot's emotional response profile.
 #[inline]
-pub fn process_packet(packet: &SensorPacket) -> VadResult {
+pub fn process_packet(packet: &SensorPacket, persona: PersonaTrait) -> VadResult {
     match packet.data_type {
-        DATA_TYPE_SENSOR_VECTOR => compute_emotional_vad(packet),
+        DATA_TYPE_SENSOR_VECTOR => compute_emotional_vad(packet, persona),
         DATA_TYPE_AUDIO | _ => compute_audio_vad(packet),
     }
 }
@@ -129,19 +133,24 @@ const DOMINANCE_W: [f32; 11] = [
 
 /// Compute emotional VAD from a sensor-vector payload.
 ///
+/// The active `persona` trait applies additive deltas to the base
+/// V/A/D weight vectors before the dot-product computation.
+///
 /// Falls back to a zero result if the payload is too short.
 #[inline]
-fn compute_emotional_vad(packet: &SensorPacket) -> VadResult {
+fn compute_emotional_vad(packet: &SensorPacket, persona: PersonaTrait) -> VadResult {
     let sv = SensorVector::from_payload(&packet.payload);
+
+    // Apply persona-specific weight deltas
+    let deltas = persona_weight_deltas(persona);
+    let val_w = apply_deltas(&VALENCE_W, &deltas.valence);
+    let aro_w = apply_deltas(&AROUSAL_W, &deltas.arousal);
+    let dom_w = apply_deltas(&DOMINANCE_W, &deltas.dominance);
 
     let (valence, arousal, dominance) = match sv {
         Some(v) => {
             let s = v.as_array();
-            (
-                weighted_sum(&s, &VALENCE_W),
-                weighted_sum(&s, &AROUSAL_W),
-                weighted_sum(&s, &DOMINANCE_W),
-            )
+            (weighted_sum(&s, &val_w), weighted_sum(&s, &aro_w), weighted_sum(&s, &dom_w))
         }
         None => (0.0, 0.0, 0.0),
     };
@@ -177,6 +186,7 @@ fn weighted_sum(sensors: &[f32; 10], weights: &[f32; 11]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persona::PersonaTrait;
     use crate::sensor::SENSOR_VECTOR_BYTES;
 
     // ── Audio VAD tests ──────────────────────────────────────────────
@@ -190,7 +200,7 @@ mod tests {
             seq: 0,
             payload: vec![0u8; 64],
         };
-        let result = process_packet(&packet);
+        let result = process_packet(&packet, PersonaTrait::Obedient);
         assert_eq!(result.kind, VadKind::Audio);
         assert!(!result.is_active);
         assert_eq!(result.energy, 0.0);
@@ -205,7 +215,7 @@ mod tests {
             seq: 0,
             payload: vec![0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f],
         };
-        let result = process_packet(&packet);
+        let result = process_packet(&packet, PersonaTrait::Obedient);
         assert_eq!(result.kind, VadKind::Audio);
         assert!(result.is_active);
         assert!(result.energy > VAD_ENERGY_THRESHOLD);
@@ -245,7 +255,7 @@ mod tests {
                 0.35, // motion_energy
             ]
         );
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         // Valence should be high (happy = positive emotion)
         assert!(r.valence > 0.65, "valence={:.3} expected > 0.65", r.valence);
@@ -276,7 +286,7 @@ mod tests {
                 0.05, // motion_energy
             ]
         );
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         // Valence should be low
         assert!(r.valence < 0.3, "valence={:.3} expected < 0.30", r.valence);
@@ -303,15 +313,15 @@ mod tests {
                 0.85, // motion_energy
             ]
         );
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         // Valence should be very low (negative emotion)
         assert!(r.valence < 0.2, "valence={:.3} expected < 0.20", r.valence);
-        // Arousal should be very high (distress)
-        assert!(r.arousal > 0.7, "arousal={:.3} expected > 0.70", r.arousal);
+        // Arousal should be high (distress) — Obedient dampens it from ~0.80 to ~0.65
+        assert!(r.arousal > 0.55, "arousal={:.3} expected > 0.55", r.arousal);
         // Dominance should be low (loss of control)
         assert!(r.dominance < 0.3, "dominance={:.3} expected < 0.30", r.dominance);
-        // Should be active (high arousal)
+        // Should be active (arousal > 0.35)
         assert!(r.is_active, "expected active for angry/fear");
     }
 
@@ -332,7 +342,7 @@ mod tests {
                 0.05, // motion_energy
             ]
         );
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         // Valence should be low-ish
         assert!(r.valence < 0.35, "valence={:.3} expected < 0.35", r.valence);
@@ -359,15 +369,15 @@ mod tests {
                 0.95, // motion_energy
             ]
         );
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         // Valence should be moderately high
         assert!(r.valence > 0.55, "valence={:.3} expected > 0.55", r.valence);
-        // Arousal should be very high
-        assert!(r.arousal > 0.7, "arousal={:.3} expected > 0.70", r.arousal);
+        // Arousal should be solid — Obedient dampens it from ~0.75 to ~0.59
+        assert!(r.arousal > 0.5, "arousal={:.3} expected > 0.50", r.arousal);
         // Dominance should be moderate-high
         assert!(r.dominance > 0.45, "dominance={:.3} expected > 0.45", r.dominance);
-        // Should be active (high arousal)
+        // Should be active (arousal > 0.35)
         assert!(r.is_active, "expected active for excited");
     }
 
@@ -380,7 +390,7 @@ mod tests {
             seq: 0,
             payload: vec![0u8; 8], // too short for 40-byte sensor vector
         };
-        let r = process_packet(&pkt);
+        let r = process_packet(&pkt, PersonaTrait::Obedient);
         assert_eq!(r.kind, VadKind::Emotional);
         assert_eq!(r.valence, 0.0);
         assert_eq!(r.arousal, 0.0);
