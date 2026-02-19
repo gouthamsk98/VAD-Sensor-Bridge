@@ -1,5 +1,6 @@
 use crate::persona::{ PersonaTrait, apply_deltas, persona_weight_deltas };
 use crate::sensor::{ SensorPacket, SensorVector, DATA_TYPE_AUDIO, DATA_TYPE_SENSOR_VECTOR };
+use crate::sensor_smoother::SensorSmoother;
 
 // ─────────────────────────────────────────────────────────────────────
 //  Unified VAD result — can originate from audio OR emotional pipeline
@@ -46,10 +47,17 @@ pub struct VadResult {
 ///
 /// The `persona` trait applies additive weight deltas to the emotional
 /// VAD weights, shaping the robot's emotional response profile.
+///
+/// The `smoother` applies EMA decay to the idle_time channel so the
+/// robot drifts into sadness gradually rather than instantly.
 #[inline]
-pub fn process_packet(packet: &SensorPacket, persona: PersonaTrait) -> VadResult {
+pub fn process_packet(
+    packet: &SensorPacket,
+    persona: PersonaTrait,
+    smoother: &SensorSmoother
+) -> VadResult {
     match packet.data_type {
-        DATA_TYPE_SENSOR_VECTOR => compute_emotional_vad(packet, persona),
+        DATA_TYPE_SENSOR_VECTOR => compute_emotional_vad(packet, persona, smoother),
         DATA_TYPE_AUDIO | _ => compute_audio_vad(packet),
     }
 }
@@ -138,7 +146,11 @@ const DOMINANCE_W: [f32; 11] = [
 ///
 /// Falls back to a zero result if the payload is too short.
 #[inline]
-fn compute_emotional_vad(packet: &SensorPacket, persona: PersonaTrait) -> VadResult {
+fn compute_emotional_vad(
+    packet: &SensorPacket,
+    persona: PersonaTrait,
+    smoother: &SensorSmoother
+) -> VadResult {
     let sv = SensorVector::from_payload(&packet.payload);
 
     // Apply persona-specific weight deltas
@@ -149,7 +161,9 @@ fn compute_emotional_vad(packet: &SensorPacket, persona: PersonaTrait) -> VadRes
 
     let (valence, arousal, dominance) = match sv {
         Some(v) => {
-            let s = v.as_array();
+            let mut s = v.as_array();
+            // Smooth idle_time via EMA so sadness ramps gradually
+            smoother.smooth(packet.sensor_id, &mut s, persona);
             (weighted_sum(&s, &val_w), weighted_sum(&s, &aro_w), weighted_sum(&s, &dom_w))
         }
         None => (0.0, 0.0, 0.0),
@@ -188,6 +202,7 @@ mod tests {
     use super::*;
     use crate::persona::PersonaTrait;
     use crate::sensor::SENSOR_VECTOR_BYTES;
+    use crate::sensor_smoother::SensorSmoother;
 
     // ── Audio VAD tests ──────────────────────────────────────────────
 
@@ -200,7 +215,8 @@ mod tests {
             seq: 0,
             payload: vec![0u8; 64],
         };
-        let result = process_packet(&packet, PersonaTrait::Obedient);
+        let smoother = SensorSmoother::new();
+        let result = process_packet(&packet, PersonaTrait::Obedient, &smoother);
         assert_eq!(result.kind, VadKind::Audio);
         assert!(!result.is_active);
         assert_eq!(result.energy, 0.0);
@@ -215,7 +231,8 @@ mod tests {
             seq: 0,
             payload: vec![0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f],
         };
-        let result = process_packet(&packet, PersonaTrait::Obedient);
+        let smoother = SensorSmoother::new();
+        let result = process_packet(&packet, PersonaTrait::Obedient, &smoother);
         assert_eq!(result.kind, VadKind::Audio);
         assert!(result.is_active);
         assert!(result.energy > VAD_ENERGY_THRESHOLD);
@@ -238,146 +255,100 @@ mod tests {
         }
     }
 
+    /// Helper: feed `n` identical packets through the smoother so the EMA
+    /// reaches near-steady-state before the assertion packet.
+    fn warm_smoother(smoother: &SensorSmoother, vals: &[f32; 10], n: usize, persona: PersonaTrait) {
+        for _ in 0..n {
+            let pkt = sensor_packet_from_floats(vals);
+            let _ = process_packet(&pkt, persona, smoother);
+        }
+    }
+
     #[test]
     fn test_happy_scenario() {
-        // HAPPY: social, known faces, conversation
-        let pkt = sensor_packet_from_floats(
-            &[
-                0.1, // battery_low
-                0.85, // people_count
-                0.95, // known_face
-                0.05, // unknown_face
-                0.0, // fall_event
-                0.0, // lifted
-                0.15, // idle_time
-                0.45, // sound_energy
-                0.75, // voice_rate
-                0.35, // motion_energy
-            ]
-        );
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+        // HAPPY: social, known faces, conversation  (idle low → smoother barely matters)
+        let smoother = SensorSmoother::new();
+        let vals = [0.1, 0.85, 0.95, 0.05, 0.0, 0.0, 0.15, 0.45, 0.75, 0.35];
+        warm_smoother(&smoother, &vals, 50, PersonaTrait::Obedient);
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
-        // Valence should be high (happy = positive emotion)
         assert!(r.valence > 0.65, "valence={:.3} expected > 0.65", r.valence);
-        // Arousal should be moderate
         assert!(
             r.arousal > 0.25 && r.arousal < 0.65,
             "arousal={:.3} expected 0.25..0.65",
             r.arousal
         );
-        // Dominance should be solid
         assert!(r.dominance > 0.55, "dominance={:.3} expected > 0.55", r.dominance);
     }
 
     #[test]
-    fn test_sad_bored_scenario() {
-        // SAD / BORED: alone, idle, quiet
-        let pkt = sensor_packet_from_floats(
-            &[
-                0.3, // battery_low
-                0.0, // people_count
-                0.0, // known_face
-                0.0, // unknown_face
-                0.0, // fall_event
-                0.0, // lifted
-                0.95, // idle_time
-                0.05, // sound_energy
-                0.0, // voice_rate
-                0.05, // motion_energy
-            ]
-        );
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+    fn test_sad_bored_scenario_converged() {
+        // SAD / BORED after many idle packets (EMA has converged)
+        let smoother = SensorSmoother::new();
+        let vals = [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.95, 0.05, 0.0, 0.05];
+        warm_smoother(&smoother, &vals, 200, PersonaTrait::Obedient);
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
-        // Valence should be low
         assert!(r.valence < 0.3, "valence={:.3} expected < 0.30", r.valence);
-        // Arousal should be very low
         assert!(r.arousal < 0.2, "arousal={:.3} expected < 0.20", r.arousal);
-        // Should NOT be active (low arousal)
-        assert!(!r.is_active, "expected inactive for sad/bored");
+        assert!(!r.is_active, "expected inactive for sad/bored after convergence");
+    }
+
+    #[test]
+    fn test_sad_bored_first_packet_is_not_sad() {
+        // First idle packet should NOT produce full sadness thanks to EMA
+        let smoother = SensorSmoother::new();
+        let vals = [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.95, 0.05, 0.0, 0.05];
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
+        // With fresh smoother, idle_time is heavily damped → arousal should be near baseline
+        // not deeply negative.  Valence should be closer to the bias (0.3) not dragged down.
+        assert!(r.valence > 0.2, "valence={:.3} should be higher on first idle packet", r.valence);
     }
 
     #[test]
     fn test_angry_fear_scenario() {
-        // ANGRY / FEAR: fall, grabbed, unknown faces
-        let pkt = sensor_packet_from_floats(
-            &[
-                0.25, // battery_low
-                0.35, // people_count
-                0.0, // known_face
-                0.75, // unknown_face
-                0.85, // fall_event
-                0.65, // lifted
-                0.05, // idle_time
-                0.75, // sound_energy
-                0.0, // voice_rate
-                0.85, // motion_energy
-            ]
-        );
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+        // ANGRY / FEAR: fall, grabbed, unknown faces (idle low → smoother barely matters)
+        let smoother = SensorSmoother::new();
+        let vals = [0.25, 0.35, 0.0, 0.75, 0.85, 0.65, 0.05, 0.75, 0.0, 0.85];
+        warm_smoother(&smoother, &vals, 50, PersonaTrait::Obedient);
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
-        // Valence should be very low (negative emotion)
         assert!(r.valence < 0.2, "valence={:.3} expected < 0.20", r.valence);
-        // Arousal should be high (distress) — Obedient dampens it from ~0.80 to ~0.65
         assert!(r.arousal > 0.55, "arousal={:.3} expected > 0.55", r.arousal);
-        // Dominance should be low (loss of control)
         assert!(r.dominance < 0.3, "dominance={:.3} expected < 0.30", r.dominance);
-        // Should be active (arousal > 0.35)
         assert!(r.is_active, "expected active for angry/fear");
     }
 
     #[test]
     fn test_tired_scenario() {
-        // TIRED: low battery, idle
-        let pkt = sensor_packet_from_floats(
-            &[
-                0.95, // battery_low
-                0.05, // people_count
-                0.1, // known_face
-                0.0, // unknown_face
-                0.0, // fall_event
-                0.0, // lifted
-                0.75, // idle_time
-                0.05, // sound_energy
-                0.05, // voice_rate
-                0.05, // motion_energy
-            ]
-        );
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+        // TIRED: low battery, idle (needs many packets to converge)
+        let smoother = SensorSmoother::new();
+        let vals = [0.95, 0.05, 0.1, 0.0, 0.0, 0.0, 0.75, 0.05, 0.05, 0.05];
+        warm_smoother(&smoother, &vals, 200, PersonaTrait::Obedient);
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
-        // Valence should be low-ish
         assert!(r.valence < 0.35, "valence={:.3} expected < 0.35", r.valence);
-        // Arousal should be very low
         assert!(r.arousal < 0.2, "arousal={:.3} expected < 0.20", r.arousal);
-        // Should NOT be active
         assert!(!r.is_active, "expected inactive for tired");
     }
 
     #[test]
     fn test_excited_scenario() {
-        // EXCITED: high activity, crowded environment
-        let pkt = sensor_packet_from_floats(
-            &[
-                0.15, // battery_low
-                0.95, // people_count
-                0.65, // known_face
-                0.35, // unknown_face
-                0.0, // fall_event
-                0.0, // lifted
-                0.0, // idle_time
-                0.95, // sound_energy
-                0.85, // voice_rate
-                0.95, // motion_energy
-            ]
-        );
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+        // EXCITED: high activity (idle=0 → smoother doesn't affect outcome)
+        let smoother = SensorSmoother::new();
+        let vals = [0.15, 0.95, 0.65, 0.35, 0.0, 0.0, 0.0, 0.95, 0.85, 0.95];
+        warm_smoother(&smoother, &vals, 50, PersonaTrait::Obedient);
+        let pkt = sensor_packet_from_floats(&vals);
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
-        // Valence should be moderately high
         assert!(r.valence > 0.55, "valence={:.3} expected > 0.55", r.valence);
-        // Arousal should be solid — Obedient dampens it from ~0.75 to ~0.59
         assert!(r.arousal > 0.5, "arousal={:.3} expected > 0.50", r.arousal);
-        // Dominance should be moderate-high
         assert!(r.dominance > 0.45, "dominance={:.3} expected > 0.45", r.dominance);
-        // Should be active (arousal > 0.35)
         assert!(r.is_active, "expected active for excited");
     }
 
@@ -388,9 +359,10 @@ mod tests {
             timestamp_us: 0,
             data_type: DATA_TYPE_SENSOR_VECTOR,
             seq: 0,
-            payload: vec![0u8; 8], // too short for 40-byte sensor vector
+            payload: vec![0u8; 8],
         };
-        let r = process_packet(&pkt, PersonaTrait::Obedient);
+        let smoother = SensorSmoother::new();
+        let r = process_packet(&pkt, PersonaTrait::Obedient, &smoother);
         assert_eq!(r.kind, VadKind::Emotional);
         assert_eq!(r.valence, 0.0);
         assert_eq!(r.arousal, 0.0);

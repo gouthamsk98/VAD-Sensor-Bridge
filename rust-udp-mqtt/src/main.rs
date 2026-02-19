@@ -3,6 +3,7 @@ mod config;
 mod esp_audio_protocol;
 mod persona;
 mod sensor;
+mod sensor_smoother;
 mod stats;
 mod vad;
 mod vad_response;
@@ -12,6 +13,7 @@ mod transport_openai;
 use clap::Parser;
 use config::Config;
 use persona::{ PersonaState, PersonaTrait };
+use sensor_smoother::SensorSmoother;
 use stats::Stats;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -46,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
     let persona_state = PersonaState::new(PersonaTrait::Obedient);
     info!(persona = %PersonaTrait::Obedient, "🎭 Default persona loaded");
 
+    // Shared sensor smoother (EMA decay for idle_time)
+    let smoother = std::sync::Arc::new(SensorSmoother::new());
+
     // Channel: UDP receivers → VAD processors
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
@@ -68,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         let stats = stats.clone();
         let vad_tx = vad_tx_clone.clone();
         let persona = persona_state.clone();
+        let smoother = smoother.clone();
         tokio::spawn(async move {
             loop {
                 let packet = {
@@ -77,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                 match packet {
                     Some(pkt) => {
                         let active_persona = persona.get_blocking();
-                        let result = vad::process_packet(&pkt, active_persona);
+                        let result = vad::process_packet(&pkt, active_persona, &smoother);
                         match result.kind {
                             vad::VadKind::Audio => {
                                 info!(

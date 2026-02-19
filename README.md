@@ -90,6 +90,45 @@ robot _feels_ about the same sensor inputs.
 
 The active persona is changed at runtime via the REST API (see below).
 
+### Idle-Time Decay (Sensor Smoother)
+
+Raw `idle_time` jumping from 0 → 0.9 in a single packet would make the robot
+instantly "sad". Real boredom is gradual, so an **Exponential Moving Average**
+(EMA) smooths the idle-time channel before VAD computation:
+
+$$
+\text{smoothed} = \alpha \times \text{raw} + (1 - \alpha) \times \text{prev\_smoothed}
+$$
+
+Only the `idle_time` channel (index 6) is smoothed; all other sensor channels
+pass through unmodified. Each physical ESP32 device (identified by `sensor_id`)
+maintains its own independent EMA state.
+
+**α is persona-dependent** — higher α = faster ramp = gets sad sooner:
+
+| Trait           | α    | Half-life (packets) | Behaviour                            |
+| --------------- | ---- | ------------------- | ------------------------------------ |
+| **Stubborn**    | 0.03 | ~23                 | Resists boredom stubbornly           |
+| **Obedient**    | 0.05 | ~14                 | Stays content for a long time        |
+| **Cute**        | 0.08 | ~9                  | Slow drift, lingers on social memory |
+| **Mischievous** | 0.15 | ~5                  | Gets antsy quickly                   |
+
+> Half-life ≈ ln(2) / α packets (continuous approximation).
+
+**Example** — idle_time stays at 0.9 for many packets (Obedient, α = 0.05):
+
+| Packet | Smoothed idle | Notes                        |
+| ------ | ------------- | ---------------------------- |
+| 1      | 0.045         | First packet, heavily damped |
+| 5      | 0.20          | Still low, not sad yet       |
+| 14     | 0.45          | Approaching half-life        |
+| 30     | 0.68          | Starting to feel bored       |
+| 60     | 0.86          | Nearly converged             |
+| 200    | ≈ 0.90        | Fully converged to raw value |
+
+The smoother also works in reverse — when activity resumes (`idle_time` drops to 0),
+the smoothed value decays gradually, preventing instant emotional whiplash.
+
 ### REST API
 
 A lightweight HTTP API (axum) runs on `--api-port` (default 8080) for runtime
@@ -408,6 +447,7 @@ vad-api/
 │       ├── main.rs                     # Entry point, tokio runtime setup
 │       ├── config.rs                   # CLI config (clap derive)
 │       ├── persona.rs                  # Personality traits + weight deltas
+│       ├── sensor_smoother.rs          # EMA idle-time decay (per-sensor, per-persona)
 │       ├── api.rs                      # REST API (axum) for persona management
 │       ├── sensor.rs                   # Binary sensor packet parser
 │       ├── esp_audio_protocol.rs       # ESP32 ↔ Server UDP audio protocol
