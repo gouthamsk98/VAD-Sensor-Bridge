@@ -202,6 +202,8 @@ pub struct EspSession {
     pub state: SessionState,
     /// Remote socket address of the ESP client.
     pub addr: std::net::SocketAddr,
+    /// MAC address from notification packet.
+    pub mac: Option<[u8; 6]>,
     /// Next outgoing sequence number (wraps at u16::MAX).
     pub out_seq: u16,
     /// Last received sequence number.
@@ -226,6 +228,7 @@ impl EspSession {
         EspSession {
             state: SessionState::Idle,
             addr,
+            mac: None,
             out_seq: 0,
             last_recv_seq: 0,
             audio_packets: 0,
@@ -277,4 +280,114 @@ impl EspSession {
     pub fn audio_duration_secs(&self) -> f64 {
         (self.audio_bytes as f64) / (16_000.0 * 2.0)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Notification Protocol (0xAA 0xB0 framing)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Packet format (14 bytes):
+// ┌───────┬───────┬───────┬───────┬─────┬──────────────┬──────┬───────┬───────┐
+// │ B0    │ B1    │ B2    │ B3    │ B4  │ B5..B10      │ B11  │ B12   │ B13   │
+// │ 0xAA  │ 0xB0  │ LenHi │ LenLo│ CMD │ MAC (6B)     │ Chk  │ 0xFF  │ 0xF5  │
+// └───────┴───────┴───────┴───────┴─────┴──────────────┴──────┴───────┴───────┘
+
+/// Start marker byte 0.
+pub const NOTIFY_START_0: u8 = 0xaa;
+/// Start marker byte 1.
+pub const NOTIFY_START_1: u8 = 0xb0;
+/// End marker byte 0.
+pub const NOTIFY_END_0: u8 = 0xff;
+/// End marker byte 1.
+pub const NOTIFY_END_1: u8 = 0xf5;
+
+/// ESP → Server: session start (wake-word detected).
+pub const NOTIFY_CMD_START: u8 = 0x51;
+/// ESP → Server: session stop (user stopped speaking).
+pub const NOTIFY_CMD_STOP: u8 = 0x50;
+/// Server → ESP: server is ready.
+pub const NOTIFY_CMD_SERVER_READY: u8 = 0x52;
+/// Server → ESP: acknowledge.
+pub const NOTIFY_CMD_ACK: u8 = 0x53;
+
+/// Fixed size of a notification packet.
+pub const NOTIFY_PACKET_SIZE: usize = 14;
+
+/// Position of the checksum byte in the notification packet.
+const NOTIFY_CHECKSUM_POS: usize = 11;
+
+/// A parsed notification packet (new 0xAA/0xB0 framing).
+#[derive(Debug, Clone)]
+pub struct NotifyPacket {
+    pub cmd: u8,
+    pub mac: [u8; 6],
+}
+
+impl NotifyPacket {
+    /// Try to parse a notification packet from raw bytes.
+    ///
+    /// Returns `None` if the buffer is too short, start/end markers don't
+    /// match, or the checksum is invalid.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < NOTIFY_PACKET_SIZE {
+            return None;
+        }
+
+        // Check start markers
+        if buf[0] != NOTIFY_START_0 || buf[1] != NOTIFY_START_1 {
+            return None;
+        }
+        // Check end markers
+        if buf[12] != NOTIFY_END_0 || buf[13] != NOTIFY_END_1 {
+            return None;
+        }
+        // Verify checksum
+        if buf[NOTIFY_CHECKSUM_POS] != compute_notify_checksum(buf) {
+            return None;
+        }
+
+        let cmd = buf[4];
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[5..11]);
+        Some(NotifyPacket { cmd, mac })
+    }
+
+    /// Format the MAC address as a colon-separated hex string.
+    pub fn mac_str(&self) -> String {
+        format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.mac[0],
+            self.mac[1],
+            self.mac[2],
+            self.mac[3],
+            self.mac[4],
+            self.mac[5]
+        )
+    }
+}
+
+/// Compute the XOR checksum for a notification packet (all bytes except
+/// the checksum position itself).
+pub fn compute_notify_checksum(buf: &[u8]) -> u8 {
+    buf.iter()
+        .enumerate()
+        .take(NOTIFY_PACKET_SIZE)
+        .filter(|&(i, _)| i != NOTIFY_CHECKSUM_POS)
+        .fold(0u8, |acc, (_, &b)| acc ^ b)
+}
+
+/// Build a 14-byte notification packet for server → ESP replies.
+pub fn build_notify_packet(cmd: u8, mac: &[u8; 6]) -> [u8; NOTIFY_PACKET_SIZE] {
+    let payload_len: u16 = 7; // MAC(6) + CMD(1)
+    let mut buf = [0u8; NOTIFY_PACKET_SIZE];
+    buf[0] = NOTIFY_START_0;
+    buf[1] = NOTIFY_START_1;
+    buf[2] = (payload_len >> 8) as u8;
+    buf[3] = (payload_len & 0xff) as u8;
+    buf[4] = cmd;
+    buf[5..11].copy_from_slice(mac);
+    buf[12] = NOTIFY_END_0;
+    buf[13] = NOTIFY_END_1;
+    buf[NOTIFY_CHECKSUM_POS] = compute_notify_checksum(&buf);
+    buf
 }

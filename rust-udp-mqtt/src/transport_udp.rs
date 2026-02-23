@@ -287,119 +287,81 @@ async fn esp_audio_recv_loop(
 
         stats.record_recv(len);
 
-        let pkt = match EspPacket::parse(&buf[..len]) {
-            Some(p) => p,
-            None => {
-                stats.record_parse_error();
-                continue;
-            }
-        };
-
-        match pkt.pkt_type {
-            // ── Heartbeat: mirror sequence number back ────────────
-            PKT_HEARTBEAT => {
-                let reply = build_heartbeat(pkt.seq_num);
-                let _ = socket.send_to(&reply, src).await;
-                debug!(thread = thread_id, src = %src, seq = pkt.seq_num, "💓 heartbeat");
-            }
-
-            // ── Control messages: drive session state machine ─────
-            PKT_CONTROL => {
-                if let Some(cmd) = pkt.control_cmd() {
-                    handle_esp_control(
-                        thread_id,
-                        cmd,
-                        &pkt,
-                        src,
-                        &socket,
-                        &sessions,
-                        &tx,
-                        &stats,
-                        &audio_save_dir,
-                        &persistent_oai
-                    ).await;
-                }
-            }
-
-            // ── Audio upstream: accumulate + forward to VAD + OpenAI ─
-            PKT_AUDIO_UP => {
-                let (should_forward, openai_tx) = {
-                    let mut map = sessions.write().await;
-                    let entry = map.entry(src).or_insert_with(|| {
-                        let mut s = EspSession::new(src);
-                        s.state = SessionState::Receiving;
-                        warn!(thread = thread_id, src = %src,
-                              "⚡ auto-started session on first audio packet (NO OpenAI tx!)");
-                        EspSessionEntry { session: s, openai_tx: None }
-                    });
-
-                    if entry.session.state == SessionState::Receiving {
-                        entry.session.record_audio(pkt.seq_num, &pkt.payload);
-                        (true, entry.openai_tx.clone())
-                    } else {
-                        debug!(src = %src, state = %entry.session.state,
-                               "audio packet ignored — session not receiving");
-                        (false, None)
-                    }
-                };
-
-                if should_forward && !pkt.payload.is_empty() {
-                    // Forward to VAD pipeline
-                    let sensor_pkt = esp_audio_to_sensor_packet(src, pkt.seq_num, &pkt.payload);
-                    if tx.try_send(sensor_pkt).is_err() {
-                        stats.record_channel_drop();
-                    }
-
-                    // Forward to OpenAI Realtime (if active)
-                    if let Some(ref oai_tx) = openai_tx {
-                        let payload_len = pkt.payload.len();
-                        match oai_tx.try_send(pkt.payload.clone()) {
-                            Ok(()) => {
-                                debug!(
-                                    src = %src, seq = pkt.seq_num, bytes = payload_len,
-                                    "audio forwarded to OpenAI tx"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(
-                                    src = %src,
-                                    "OpenAI tx channel full — dropping audio chunk"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                warn!(
-                                    src = %src,
-                                    "OpenAI tx channel closed — session may have ended"
-                                );
-                            }
-                        }
-                    } else {
-                        debug!(src = %src, "no OpenAI tx — audio not forwarded to OpenAI");
-                    }
-                }
-
-                // If the END flag is set, treat it like SESSION_END
-                if pkt.is_end() {
-                    handle_esp_control(
-                        thread_id,
-                        CTRL_SESSION_END,
-                        &pkt,
-                        src,
-                        &socket,
-                        &sessions,
-                        &tx,
-                        &stats,
-                        &audio_save_dir,
-                        &persistent_oai
-                    ).await;
-                }
-            }
-
-            other => {
-                debug!(thread = thread_id, src = %src, pkt_type = other,
-                       "unexpected ESP packet type");
-            }
+        // ── New notification protocol (0xAA 0xB0 framing) ──────────
+        if let Some(notify) = NotifyPacket::parse(&buf[..len]) {
+            handle_notify_cmd(
+                thread_id,
+                &notify,
+                src,
+                &socket,
+                &sessions,
+                &tx,
+                &stats,
+                &audio_save_dir,
+                &persistent_oai
+            ).await;
+            continue;
         }
+
+        // ── Legacy ESP protocol (4-byte header) ────────────────────
+        if let Some(pkt) = EspPacket::parse(&buf[..len]) {
+            match pkt.pkt_type {
+                PKT_HEARTBEAT => {
+                    let reply = build_heartbeat(pkt.seq_num);
+                    let _ = socket.send_to(&reply, src).await;
+                    debug!(thread = thread_id, src = %src, seq = pkt.seq_num, "💓 heartbeat");
+                }
+                PKT_CONTROL => {
+                    if let Some(cmd) = pkt.control_cmd() {
+                        handle_esp_control(
+                            thread_id,
+                            cmd,
+                            &pkt,
+                            src,
+                            &socket,
+                            &sessions,
+                            &tx,
+                            &stats,
+                            &audio_save_dir,
+                            &persistent_oai
+                        ).await;
+                    }
+                }
+                PKT_AUDIO_UP => {
+                    handle_raw_pcm_audio(
+                        thread_id,
+                        &pkt.payload,
+                        src,
+                        &sessions,
+                        &tx,
+                        &stats
+                    ).await;
+                    // Legacy: if END flag is set, treat as SESSION_END
+                    if pkt.is_end() {
+                        handle_esp_control(
+                            thread_id,
+                            CTRL_SESSION_END,
+                            &pkt,
+                            src,
+                            &socket,
+                            &sessions,
+                            &tx,
+                            &stats,
+                            &audio_save_dir,
+                            &persistent_oai
+                        ).await;
+                    }
+                }
+                other => {
+                    debug!(thread = thread_id, src = %src, pkt_type = other,
+                           "unexpected ESP packet type");
+                }
+            }
+            continue;
+        }
+
+        // ── Raw PCM audio (no header — new-protocol ESPs) ──────────
+        handle_raw_pcm_audio(thread_id, &buf[..len], src, &sessions, &tx, &stats).await;
     }
 }
 
@@ -547,6 +509,188 @@ async fn handle_esp_control(
 
         other => {
             debug!(src = %src, cmd = other, "unhandled ESP control command");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  New Notification Protocol handlers (0xAA 0xB0 framing)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Handle a parsed notification packet (start / stop session).
+async fn handle_notify_cmd(
+    thread_id: usize,
+    notify: &NotifyPacket,
+    src: SocketAddr,
+    socket: &Arc<UdpSocket>,
+    sessions: &SessionMap,
+    _tx: &mpsc::Sender<SensorPacket>,
+    _stats: &Arc<Stats>,
+    audio_save_dir: &str,
+    persistent_oai: &Option<Arc<OpenAiSession>>
+) {
+    let mac_str = notify.mac_str();
+
+    match notify.cmd {
+        // ── START: create/reset session, wire OpenAI, reply ────────
+        NOTIFY_CMD_START => {
+            let openai_tx = if let Some(ref oai) = persistent_oai {
+                oai.set_active_esp(src).await;
+                oai.clear_input_buffer().await;
+                info!(src = %src, mac = %mac_str,
+                      "🤖 wired ESP client to persistent OpenAI session");
+                Some(oai.audio_tx.clone())
+            } else {
+                debug!(src = %src, "OpenAI Realtime not enabled — skipping");
+                None
+            };
+
+            {
+                let mut map = sessions.write().await;
+                let entry = map.entry(src).or_insert_with(|| EspSessionEntry {
+                    session: EspSession::new(src),
+                    openai_tx: None,
+                });
+                entry.session.reset();
+                entry.session.state = SessionState::Receiving;
+                entry.session.mac = Some(notify.mac);
+                let has_openai = openai_tx.is_some();
+                entry.openai_tx = openai_tx;
+                info!(src = %src, has_openai_tx = has_openai, "session entry updated");
+            }
+
+            let reply = build_notify_packet(NOTIFY_CMD_SERVER_READY, &notify.mac);
+            let _ = socket.send_to(&reply, src).await;
+            info!(thread = thread_id, src = %src, mac = %mac_str,
+                  "📞 ESP session started (notify) → SERVER_READY sent");
+        }
+
+        // ── STOP: save WAV, commit OpenAI, send ACK, reset ────────
+        NOTIFY_CMD_STOP => {
+            let session_data = {
+                let mut map = sessions.write().await;
+                if let Some(entry) = map.get_mut(&src) {
+                    if entry.session.state == SessionState::Receiving {
+                        entry.session.state = SessionState::Processing;
+                        entry.openai_tx = None;
+                        Some((
+                            entry.session.audio_buffer.clone(),
+                            entry.session.audio_packets,
+                            entry.session.audio_bytes,
+                            entry.session.packets_lost,
+                            entry.session.elapsed(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(ref oai) = persistent_oai {
+                oai.commit_input_buffer().await;
+                oai.create_response().await;
+                info!(src = %src,
+                      "📝 committed OpenAI audio buffer + triggered response on session end");
+            }
+
+            if let Some((audio_buf, pkts, bytes, lost, duration)) = session_data {
+                let audio_secs = (bytes as f64) / (16_000.0 * 2.0);
+                info!(
+                    src = %src,
+                    packets = pkts,
+                    bytes = bytes,
+                    lost = lost,
+                    duration_secs = format!("{:.1}", duration.as_secs_f64()),
+                    audio_secs = format!("{:.1}", audio_secs),
+                    "📴 ESP session ended (notify)"
+                );
+
+                if !audio_buf.is_empty() {
+                    match save_session_wav(audio_save_dir, src, &audio_buf).await {
+                        Ok(path) => info!(path = %path, "💾 session audio saved"),
+                        Err(e) => warn!(error = %e, "failed to save session audio"),
+                    }
+                }
+
+                let reply = build_notify_packet(NOTIFY_CMD_ACK, &notify.mac);
+                let _ = socket.send_to(&reply, src).await;
+
+                {
+                    let mut map = sessions.write().await;
+                    if let Some(entry) = map.get_mut(&src) {
+                        entry.session.reset();
+                        entry.openai_tx = None;
+                    }
+                }
+            } else {
+                let reply = build_notify_packet(NOTIFY_CMD_ACK, &notify.mac);
+                let _ = socket.send_to(&reply, src).await;
+            }
+        }
+
+        other => {
+            debug!(thread = thread_id, src = %src, cmd = other,
+                   "unknown notification command");
+        }
+    }
+}
+
+/// Handle raw PCM audio data (no protocol header).
+async fn handle_raw_pcm_audio(
+    thread_id: usize,
+    audio_data: &[u8],
+    src: SocketAddr,
+    sessions: &SessionMap,
+    tx: &mpsc::Sender<SensorPacket>,
+    stats: &Arc<Stats>
+) {
+    if audio_data.is_empty() {
+        return;
+    }
+
+    let (should_forward, openai_tx, seq) = {
+        let mut map = sessions.write().await;
+        if let Some(entry) = map.get_mut(&src) {
+            if entry.session.state == SessionState::Receiving {
+                let seq = entry.session.audio_packets as u16;
+                entry.session.record_audio(seq, audio_data);
+                (true, entry.openai_tx.clone(), seq)
+            } else {
+                debug!(src = %src, state = %entry.session.state,
+                       "audio ignored — session not receiving");
+                (false, None, 0)
+            }
+        } else {
+            debug!(thread = thread_id, src = %src,
+                   "audio from unknown source — no active session");
+            (false, None, 0)
+        }
+    };
+
+    if should_forward {
+        let sensor_pkt = esp_audio_to_sensor_packet(src, seq, audio_data);
+        if tx.try_send(sensor_pkt).is_err() {
+            stats.record_channel_drop();
+        }
+
+        if let Some(ref oai_tx) = openai_tx {
+            let payload_len = audio_data.len();
+            match oai_tx.try_send(audio_data.to_vec()) {
+                Ok(()) => {
+                    debug!(src = %src, bytes = payload_len,
+                           "audio forwarded to OpenAI tx");
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(src = %src,
+                          "OpenAI tx channel full — dropping audio chunk");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(src = %src,
+                          "OpenAI tx channel closed — session may have ended");
+                }
+            }
         }
     }
 }

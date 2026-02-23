@@ -175,9 +175,11 @@ curl http://localhost:8080/persona/list
 
 ## Wire Formats
 
-### ESP Audio Protocol (4-byte header + variable payload)
+### ESP Audio Protocol (4-byte header + variable payload — legacy)
 
 Used on UDP port 9001. Audio format: **16-bit LE PCM, 16 kHz, mono**.
+The server also accepts the newer [Notification Protocol](#notification-protocol-0xaa-0xb0-framing--new)
+and raw PCM audio on the same port.
 
 ```
 ┌─────────────┬──────────┬──────────┬────────────────┐
@@ -211,6 +213,54 @@ Used on UDP port 9001. Audio format: **16-bit LE PCM, 16 kHz, mono**.
 | 0x07  | SERVER_READY  | Server → ESP  | Server is ready for audio    |
 
 1400 B payload = 700 samples = 43.75 ms per packet at 16 kHz.
+
+### Notification Protocol (0xAA 0xB0 framing — new)
+
+The new ESP notification protocol uses a **14-byte fixed-size packet** with
+start/end markers, a command byte, and the ESP's WiFi STA MAC address.
+This is used for session start/stop signalling; raw PCM audio is sent as
+**headerless UDP payloads** between a start and stop notification.
+
+```
+┌───────┬───────┬───────┬───────┬─────┬──────────────┬──────┬───────┬───────┐
+│ B0    │ B1    │ B2    │ B3    │ B4  │ B5..B10      │ B11  │ B12   │ B13   │
+│ 0xAA  │ 0xB0  │ LenHi │ LenLo│ CMD │ MAC (6 bytes)│ Chk  │ 0xFF  │ 0xF5  │
+│ start │ start │       │      │     │              │ XOR  │ end   │ end   │
+└───────┴───────┴───────┴───────┴─────┴──────────────┴──────┴───────┴───────┘
+```
+
+**Fields:**
+
+| Offset | Size | Field       | Description                                 |
+| ------ | ---- | ----------- | ------------------------------------------- |
+| 0      | 1    | Start byte  | Always `0xAA`                               |
+| 1      | 1    | Start byte  | Always `0xB0`                               |
+| 2–3    | 2    | Length (BE) | Payload length = `0x0007` (MAC + CMD)       |
+| 4      | 1    | CMD         | Command byte (see table below)              |
+| 5–10   | 6    | MAC         | ESP32 WiFi STA MAC address (`esp_read_mac`) |
+| 11     | 1    | Checksum    | XOR of all bytes except this position       |
+| 12     | 1    | End byte    | Always `0xFF`                               |
+| 13     | 1    | End byte    | Always `0xF5`                               |
+
+**Commands:**
+
+| Value | Name         | Direction    | Description                         |
+| ----- | ------------ | ------------ | ----------------------------------- |
+| 0x51  | START        | ESP → Server | Wake word / session start           |
+| 0x50  | STOP         | ESP → Server | User stopped speaking / session end |
+| 0x52  | SERVER_READY | Server → ESP | Server is ready for audio           |
+| 0x53  | ACK          | Server → ESP | Acknowledge stop                    |
+
+**Audio flow with notification protocol:**
+
+1. ESP sends **START** notification (0x51) with its MAC
+2. Server replies **SERVER_READY** (0x52) with same MAC
+3. ESP streams **raw 16-bit LE PCM** (16 kHz, mono) as headerless UDP payloads
+4. ESP sends **STOP** notification (0x50) with its MAC
+5. Server saves session audio as WAV, commits to OpenAI, replies **ACK** (0x53)
+
+> The server auto-detects the packet format: notification protocol (0xAA 0xB0),
+> legacy ESP protocol (4-byte header), or raw PCM audio — all on the same port.
 
 ### Binary Sensor Packet (32-byte header + variable payload)
 
