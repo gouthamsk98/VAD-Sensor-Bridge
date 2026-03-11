@@ -16,7 +16,7 @@ use persona::{ PersonaState, PersonaTrait };
 use sensor_smoother::SensorSmoother;
 use stats::Stats;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{ info, debug };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
                         let result = vad::process_packet(&pkt, active_persona, &smoother);
                         match result.kind {
                             vad::VadKind::Audio => {
-                                info!(
+                                debug!(
                                     sensor_id = result.sensor_id,
                                     seq = result.seq,
                                     is_active = result.is_active,

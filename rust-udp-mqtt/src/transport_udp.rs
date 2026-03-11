@@ -287,11 +287,35 @@ async fn esp_audio_recv_loop(
 
         stats.record_recv(len);
 
+        // Log every incoming packet on the audio port (debug level to avoid log flood)
+        let hex_preview: String = buf[..len.min(32)]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        debug!(
+            thread = thread_id,
+            src = %src,
+            bytes = len,
+            hex = %hex_preview,
+            "📥 UDP:9001 raw data received"
+        );
+
         // ── New notification protocol (0xAA 0xB0 framing) ──────────
-        if let Some(notify) = NotifyPacket::parse(&buf[..len]) {
+        if let Some(result) = NotifyPacket::parse(&buf[..len]) {
+            debug!(
+                thread = thread_id,
+                src = %src,
+                cmd = format!("0x{:02x}", result.packet.cmd),
+                mac = %result.packet.mac_str(),
+                header_end = result.header_end,
+                trailing_audio = len.saturating_sub(result.header_end),
+                "🔔 notification parsed"
+            );
+
             handle_notify_cmd(
                 thread_id,
-                &notify,
+                &result.packet,
                 src,
                 &socket,
                 &sessions,
@@ -300,6 +324,20 @@ async fn esp_audio_recv_loop(
                 &audio_save_dir,
                 &persistent_oai
             ).await;
+
+            // If the same datagram contains audio data after the
+            // notification header (common for START + first audio
+            // chunk), feed it into the PCM pipeline immediately.
+            if result.header_end < len {
+                let trailing = &buf[result.header_end..len];
+                debug!(
+                    thread = thread_id,
+                    src = %src,
+                    bytes = trailing.len(),
+                    "🔊 processing trailing audio from notification packet"
+                );
+                handle_raw_pcm_audio(thread_id, trailing, src, &sessions, &tx, &stats).await;
+            }
             continue;
         }
 
@@ -437,35 +475,43 @@ async fn handle_esp_control(
                 }
             };
 
-            // Commit any remaining audio in the OpenAI buffer so it
-            // gets processed even if server_vad hasn't auto-committed.
-            // NOTE: we do NOT clear active_esp here — the response audio
-            // may arrive after SESSION_END and must still route to this ESP.
-            // active_esp gets overwritten on the next SESSION_START.
-            if let Some(ref oai) = persistent_oai {
-                oai.commit_input_buffer().await;
-                oai.create_response().await;
-                info!(src = %src, "📝 committed OpenAI audio buffer + triggered response on session end");
-            }
-
             if let Some((audio_buf, pkts, bytes, lost, duration)) = session_data {
                 let audio_secs = (bytes as f64) / (16_000.0 * 2.0);
+                let elapsed_ms = duration.as_millis();
+                let elapsed_human = if elapsed_ms < 1_000 {
+                    format!("{}ms", elapsed_ms)
+                } else if elapsed_ms < 60_000 {
+                    format!("{:.1}s", duration.as_secs_f64())
+                } else {
+                    let mins = elapsed_ms / 60_000;
+                    let secs = ((elapsed_ms % 60_000) as f64) / 1000.0;
+                    format!("{}m {:.1}s", mins, secs)
+                };
                 info!(
                     src = %src,
                     packets = pkts,
                     bytes = bytes,
                     lost = lost,
-                    duration_secs = format!("{:.1}", duration.as_secs_f64()),
+                    elapsed = %elapsed_human,
                     audio_secs = format!("{:.1}", audio_secs),
-                    "📴 ESP session ended"
+                    "📴 ESP session ended — START→STOP took {}", elapsed_human
                 );
 
-                // Persist the accumulated audio as WAV
+                // Only commit + trigger OpenAI response if real audio was received
                 if !audio_buf.is_empty() {
+                    if let Some(ref oai) = persistent_oai {
+                        oai.commit_input_buffer().await;
+                        oai.create_response().await;
+                        info!(src = %src, audio_secs = format!("{:.1}", audio_secs),
+                              "📝 committed OpenAI audio buffer + triggered response");
+                    }
+
                     match save_session_wav(audio_save_dir, src, &audio_buf).await {
                         Ok(path) => info!(path = %path, "💾 session audio saved"),
                         Err(e) => warn!(error = %e, "failed to save session audio"),
                     }
+                } else {
+                    info!(src = %src, "⏭️ session ended with no audio — skipping OpenAI commit");
                 }
 
                 // Send ACK
@@ -559,10 +605,8 @@ async fn handle_notify_cmd(
                 info!(src = %src, has_openai_tx = has_openai, "session entry updated");
             }
 
-            let reply = build_notify_packet(NOTIFY_CMD_SERVER_READY, &notify.mac);
-            let _ = socket.send_to(&reply, src).await;
             info!(thread = thread_id, src = %src, mac = %mac_str,
-                  "📞 ESP session started (notify) → SERVER_READY sent");
+                  "📞 ESP session started (notify)");
         }
 
         // ── STOP: save WAV, commit OpenAI, send ACK, reset ────────
@@ -588,34 +632,44 @@ async fn handle_notify_cmd(
                 }
             };
 
-            if let Some(ref oai) = persistent_oai {
-                oai.commit_input_buffer().await;
-                oai.create_response().await;
-                info!(src = %src,
-                      "📝 committed OpenAI audio buffer + triggered response on session end");
-            }
-
             if let Some((audio_buf, pkts, bytes, lost, duration)) = session_data {
                 let audio_secs = (bytes as f64) / (16_000.0 * 2.0);
+                let elapsed_ms = duration.as_millis();
+                let elapsed_human = if elapsed_ms < 1_000 {
+                    format!("{}ms", elapsed_ms)
+                } else if elapsed_ms < 60_000 {
+                    format!("{:.1}s", duration.as_secs_f64())
+                } else {
+                    let mins = elapsed_ms / 60_000;
+                    let secs = ((elapsed_ms % 60_000) as f64) / 1000.0;
+                    format!("{}m {:.1}s", mins, secs)
+                };
                 info!(
                     src = %src,
                     packets = pkts,
                     bytes = bytes,
                     lost = lost,
-                    duration_secs = format!("{:.1}", duration.as_secs_f64()),
+                    elapsed = %elapsed_human,
                     audio_secs = format!("{:.1}", audio_secs),
-                    "📴 ESP session ended (notify)"
+                    "📴 ESP session ended (notify) — START→STOP took {}", elapsed_human
                 );
 
+                // Only commit + trigger OpenAI response if real audio was received
                 if !audio_buf.is_empty() {
+                    if let Some(ref oai) = persistent_oai {
+                        oai.commit_input_buffer().await;
+                        oai.create_response().await;
+                        info!(src = %src, audio_secs = format!("{:.1}", audio_secs),
+                              "📝 committed OpenAI audio buffer + triggered response");
+                    }
+
                     match save_session_wav(audio_save_dir, src, &audio_buf).await {
                         Ok(path) => info!(path = %path, "💾 session audio saved"),
                         Err(e) => warn!(error = %e, "failed to save session audio"),
                     }
+                } else {
+                    info!(src = %src, "⏭️ session ended with no audio — skipping OpenAI commit");
                 }
-
-                let reply = build_notify_packet(NOTIFY_CMD_ACK, &notify.mac);
-                let _ = socket.send_to(&reply, src).await;
 
                 {
                     let mut map = sessions.write().await;
@@ -625,8 +679,9 @@ async fn handle_notify_cmd(
                     }
                 }
             } else {
-                let reply = build_notify_packet(NOTIFY_CMD_ACK, &notify.mac);
-                let _ = socket.send_to(&reply, src).await;
+                // No active session — this is a keep-alive STOP, ignore
+                debug!(thread = thread_id, src = %src, mac = %mac_str,
+                       "🔄 STOP keep-alive (no active session)");
             }
         }
 
@@ -687,7 +742,7 @@ async fn handle_raw_pcm_audio(
                           "OpenAI tx channel full — dropping audio chunk");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    warn!(src = %src,
+                    debug!(src = %src,
                           "OpenAI tx channel closed — session may have ended");
                 }
             }
@@ -728,13 +783,10 @@ async fn save_session_wav(dir: &str, src: SocketAddr, pcm_data: &[u8]) -> anyhow
 
     tokio::fs::create_dir_all(dir).await?;
 
-    let epoch_secs = std::time::SystemTime
-        ::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d_%H%M%S").to_string();
     let ip_str = src.ip().to_string().replace('.', "_").replace(':', "_");
-    let filename = format!("esp_{}_{}.wav", ip_str, epoch_secs);
+    let filename = format!("esp_{}_{}.wav", ip_str, ts);
     let path = format!("{}/{}", dir, filename);
 
     let data_len = pcm_data.len() as u32;

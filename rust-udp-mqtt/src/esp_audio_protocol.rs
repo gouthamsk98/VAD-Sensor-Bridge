@@ -21,6 +21,8 @@ pub const ESP_HEADER_SIZE: usize = 4;
 
 /// Maximum payload size — stays under typical 1500-byte MTU.
 pub const ESP_MAX_PAYLOAD: usize = 1400;
+/// Response audio chunk size (smaller for ESP receive reliability).
+pub const RESPONSE_CHUNK_SIZE: usize = 1024;
 
 // ── Packet Types ───────────────────────────────────────────────────────
 
@@ -316,6 +318,17 @@ pub const NOTIFY_PACKET_SIZE: usize = 14;
 /// Position of the checksum byte in the notification packet.
 const NOTIFY_CHECKSUM_POS: usize = 11;
 
+/// Result of parsing a notification packet — includes the byte offset
+/// where the notification header ends, so any trailing audio data in the
+/// same UDP datagram can be forwarded to the PCM pipeline.
+#[derive(Debug, Clone)]
+pub struct NotifyParseResult {
+    pub packet: NotifyPacket,
+    /// Byte offset (from the start of the original buffer) where the
+    /// notification header ends.  Bytes `[header_end..len]` are audio.
+    pub header_end: usize,
+}
+
 /// A parsed notification packet (new 0xAA/0xB0 framing).
 #[derive(Debug, Clone)]
 pub struct NotifyPacket {
@@ -326,30 +339,67 @@ pub struct NotifyPacket {
 impl NotifyPacket {
     /// Try to parse a notification packet from raw bytes.
     ///
-    /// Returns `None` if the buffer is too short, start/end markers don't
-    /// match, or the checksum is invalid.
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        if buf.len() < NOTIFY_PACKET_SIZE {
+    /// The parser is intentionally lenient to handle the several packet
+    /// variants the ESP firmware emits:
+    ///
+    /// 1. **12-byte bare**  – `AA B0 LEN_H LEN_L CMD MAC[6] CHK`
+    ///    (no end markers).
+    /// 2. **14-byte full**   – same as above + `FF F5` end markers.
+    /// 3. **16-byte prefixed** – `FF F5` prefix + 14-byte full.
+    /// 4. **14-byte header + trailing PCM audio** – START notification
+    ///    followed by raw audio in the same UDP datagram.
+    ///
+    /// Checksum validation is **skipped** because the ESP firmware
+    /// currently uses a different algorithm than originally specified.
+    pub fn parse(buf: &[u8]) -> Option<NotifyParseResult> {
+        // Scan forward for the AA B0 start marker (handles FF F5 prefix).
+        // Limit scan to the first 2 bytes of offset to avoid false
+        // positives inside raw audio data (only legitimate prefix is
+        // the 2-byte FF F5 end-marker from a previous frame).
+        let start = buf
+            .windows(2)
+            .take(3) // positions 0, 1, 2 only
+            .position(|w| w[0] == NOTIFY_START_0 && w[1] == NOTIFY_START_1)?;
+
+        let remaining = &buf[start..];
+
+        // Need at least 12 bytes: AA B0 LEN_H LEN_L CMD MAC[6] CHK
+        if remaining.len() < 12 {
             return None;
         }
 
-        // Check start markers
-        if buf[0] != NOTIFY_START_0 || buf[1] != NOTIFY_START_1 {
-            return None;
-        }
-        // Check end markers
-        if buf[12] != NOTIFY_END_0 || buf[13] != NOTIFY_END_1 {
-            return None;
-        }
-        // Verify checksum
-        if buf[NOTIFY_CHECKSUM_POS] != compute_notify_checksum(buf) {
+        let cmd = remaining[4];
+
+        // Only accept known notification commands to avoid false
+        // positives from audio data that coincidentally starts with
+        // AA B0.
+        if
+            !matches!(
+                cmd,
+                NOTIFY_CMD_START | NOTIFY_CMD_STOP | NOTIFY_CMD_SERVER_READY | NOTIFY_CMD_ACK
+            )
+        {
             return None;
         }
 
-        let cmd = buf[4];
         let mut mac = [0u8; 6];
-        mac.copy_from_slice(&buf[5..11]);
-        Some(NotifyPacket { cmd, mac })
+        mac.copy_from_slice(&remaining[5..11]);
+
+        // Determine header length — with or without FF F5 end markers.
+        let header_end = if
+            remaining.len() >= 14 &&
+            remaining[12] == NOTIFY_END_0 &&
+            remaining[13] == NOTIFY_END_1
+        {
+            start + 14
+        } else {
+            start + 12
+        };
+
+        Some(NotifyParseResult {
+            packet: NotifyPacket { cmd, mac },
+            header_end,
+        })
     }
 
     /// Format the MAC address as a colon-separated hex string.
@@ -390,4 +440,95 @@ pub fn build_notify_packet(cmd: u8, mac: &[u8; 6]) -> [u8; NOTIFY_PACKET_SIZE] {
     buf[13] = NOTIFY_END_1;
     buf[NOTIFY_CHECKSUM_POS] = compute_notify_checksum(&buf);
     buf
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Server → Device Protocol (0xB0 0xAA framing)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Frame format:
+//   [0xB0][0xAA][len_hi][len_lo][CMD][...payload...][CRC-8][0xFF][0xF5]
+//
+// CRC-8 polynomial 0x07 — computed over bytes [2 .. len-3).
+
+/// Server → Device header byte 0.
+pub const S2D_HEADER_0: u8 = 0xB0;
+/// Server → Device header byte 1.
+pub const S2D_HEADER_1: u8 = 0xAA;
+/// Footer byte 0.
+pub const S2D_FOOTER_0: u8 = 0xFF;
+/// Footer byte 1.
+pub const S2D_FOOTER_1: u8 = 0xF5;
+
+/// CMD: audio settings (reconfigure I2S).
+pub const S2D_CMD_AUDIO_SETTINGS: u8 = 0x5A;
+/// CMD: stop playback.
+pub const S2D_CMD_STOP: u8 = 0x0A;
+
+/// CRC-8 with polynomial 0x07.
+///
+/// Matches the ESP32 `checkSum()` in `app_dataparse.cpp`:
+/// iterates over `frame[2 .. len-3]` with CRC-8 poly 0x07.
+fn crc8_s2d(frame: &[u8]) -> u8 {
+    if frame.len() < 5 {
+        return 0;
+    }
+    let end = frame.len() - 3; // skip last 3 bytes (CRC + footer)
+    let mut crc: u8 = 0x00;
+    for &b in &frame[2..end] {
+        crc ^= b;
+        for _ in 0..8 {
+            if crc & 0x80 != 0 {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// Build an audio-settings frame (CMD 0x5A) — 17 bytes.
+///
+/// Tells the device to reconfigure I2S:
+///   `[0xB0][0xAA][0x00][0x0A][0x5A][rate:4B][bits:4B][ch:1B][CRC][0xFF][0xF5]`
+pub fn build_s2d_audio_settings(rate: u32, bits: u32, channels: u8) -> [u8; 17] {
+    let payload_len: u16 = 10; // CMD(1) + rate(4) + bits(4) + ch(1)
+    let mut f = [0u8; 17];
+    f[0] = S2D_HEADER_0;
+    f[1] = S2D_HEADER_1;
+    f[2] = (payload_len >> 8) as u8;
+    f[3] = (payload_len & 0xFF) as u8;
+    f[4] = S2D_CMD_AUDIO_SETTINGS;
+    f[5] = (rate >> 24) as u8;
+    f[6] = (rate >> 16) as u8;
+    f[7] = (rate >> 8) as u8;
+    f[8] = rate as u8;
+    f[9] = (bits >> 24) as u8;
+    f[10] = (bits >> 16) as u8;
+    f[11] = (bits >> 8) as u8;
+    f[12] = bits as u8;
+    f[13] = channels;
+    f[14] = crc8_s2d(&f);
+    f[15] = S2D_FOOTER_0;
+    f[16] = S2D_FOOTER_1;
+    f
+}
+
+/// Build a stop frame (CMD 0x0A) — 8 bytes.
+///
+/// Tells the device to stop playback:
+///   `[0xB0][0xAA][0x00][0x01][0x0A][CRC][0xFF][0xF5]`
+pub fn build_s2d_stop() -> [u8; 8] {
+    let payload_len: u16 = 1; // just CMD
+    let mut f = [0u8; 8];
+    f[0] = S2D_HEADER_0;
+    f[1] = S2D_HEADER_1;
+    f[2] = (payload_len >> 8) as u8;
+    f[3] = (payload_len & 0xFF) as u8;
+    f[4] = S2D_CMD_STOP;
+    f[5] = crc8_s2d(&f);
+    f[6] = S2D_FOOTER_0;
+    f[7] = S2D_FOOTER_1;
+    f
 }

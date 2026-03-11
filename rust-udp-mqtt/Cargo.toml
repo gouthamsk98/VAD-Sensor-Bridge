@@ -32,6 +32,8 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 # Base64 encoding for audio chunks
 base64 = "0.22"
+# Human-readable timestamps for saved audio files
+chrono = "0.4"
 
 [profile.release]
 opt-level = 3
